@@ -179,6 +179,20 @@ static struct stordb_col *db_col(struct stordb_tbl *tbl, int i) {
     return &tbl->tbl_cols.data[i];
 }
 
+static struct stordb_col *db_colname(struct stordb_tbl *tbl, const char *name, int *colidx) {
+    struct stordb_col *col;
+    int i = 0;
+    vec_foreach_ptr(&tbl->tbl_cols, col, i) {
+        if (strncmp(col->col_name, name, STOR_COLNAME_MAX) == 0) {
+            if (colidx != NULL) {
+                *colidx = i;
+            }
+            return col;
+        }
+    }
+    return NULL;
+}
+
 static int db_flush_meta(struct stordb *db) {
     if (db->db_fd <= 0) {
         return -1;
@@ -189,7 +203,9 @@ static int db_flush_meta(struct stordb *db) {
     int seek_res, write_res;
     seek_res = db_seek(db, SEEK_SET, 0);
     if (seek_res != 0) return seek_res;
-    write_res = db_write(db, &db->db_meta, DB_META_SER_BYTES(&db->db_meta));
+    ASSERT(db->db_meta.mt_magic == STOR_META_MAGIC);
+    size_t meta_bytes = DB_META_SER_BYTES(&db->db_meta);
+    write_res = db_write(db, &db->db_meta, meta_bytes);
     if (write_res == -1) return write_res;
     for (int i = 0; i < db->db_meta.mt_num_tables; i++) {
         struct stordb_tbl *tbl = db_table(db, i);
@@ -259,7 +275,7 @@ static const char *coltype_str(enum stor_coltype coltype) {
 }
 
 static int db_add_table(struct stordb *db, const char *tblname, const char *colinfo, dberr_t *dberr) {
-    if (strlen(tblname)+1 > STOR_TBLNAME_MAX) {
+    if (strnlen(tblname, STOR_TBLNAME_MAX)+1 > STOR_TBLNAME_MAX) {
         *dberr = DBERR_TBLNAME_TOO_LONG;
         db_set_lasterr(db, dberr, strndup(tblname, STOR_TBLNAME_MAX));
         return -1;
@@ -289,7 +305,7 @@ static int db_add_table(struct stordb *db, const char *tblname, const char *coli
     vec_init(&newtbl->tbl_cols);
     vec_init(&newtbl->tbl_blks);
 
-    char *colinfoend = (char*)colinfo + strlen(colinfo);
+    char *colinfoend = (char*)colinfo + strnlen(colinfo, 1024);
     char *colsep = NULL; // 'col1:type1[,]col2:type2'
     char *coltypesep = NULL; // 'col1[:]type1'
     char *coltypebeg = NULL; // type1
@@ -365,37 +381,43 @@ static int db_deserialize_val(struct stordb *db, char *dbval, enum stor_coltype 
         case COLTYPE_INT: {
             long val = strtol(dbval, NULL, 10);
             if (val < INT_MIN || val > INT_MAX) {
-                DEBUG(DBG_INSERT, "int out of range: %s\n", dbval);
+                DEBUG(DBG_DESER, "int out of range: %s\n", dbval);
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
                 db_set_lasterr(db, dberr, strndup(dbval, 12));
                 return -1;
             }
             int ival = (int)val;
             tval->val = (dbval_t)ival;
-            *valsz = sizeof(int);
+            if (valsz) {
+                *valsz = sizeof(int);
+            }
             break;
         }
         case COLTYPE_CHAR: {
             char c = *dbval;
-            if (strlen(dbval) > 1) {
-                DEBUG(DBG_INSERT, "char out of range: %s\n", dbval);
+            if (strnlen(dbval, 2) > 1) {
+                DEBUG(DBG_DESER, "char out of range: %s\n", dbval);
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
                 db_set_lasterr(db, dberr, strndup(dbval, 10));
                 return -1;
             }
             tval->val = (dbval_t)c;
-            *valsz = sizeof(char);
+            if (valsz) {
+                *valsz = sizeof(char);
+            }
             break;
         }
         case COLTYPE_VARCHAR: {
-            size_t len = strlen(dbval);
+            size_t len = strnlen(dbval, STOR_VARCHAR_MAX+1);
             if (len > STOR_VARCHAR_MAX) {
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
                 db_set_lasterr(db, dberr, strndup(dbval, STOR_VARCHAR_MAX));
                 return -1;
             }
             tval->val = (dbval_t)dbval;
-            *valsz = len+1;
+            if (valsz) {
+                *valsz = len+1;
+            }
             break;
         }
         case COLTYPE_DOUBLE: {
@@ -406,7 +428,9 @@ static int db_deserialize_val(struct stordb *db, char *dbval, enum stor_coltype 
                 return -1;
             }
             tval->val = (dbval_t)val;
-            *valsz = sizeof(double);
+            if (valsz) {
+                *valsz = sizeof(double);
+            }
             break;
         }
         default:
@@ -479,7 +503,7 @@ struct stordb_blk_h *db_find_blk_for_rec(struct stordb *db, struct stordb_tbl *t
         if (blk == NULL || blk->bh_magic != STOR_BLKH_MAGIC) {
             break;
         }
-        if (blk->bh_free >= recsz) {
+        if (blk->bh_free >= (recsz+2)) {
             found = blk;
             break;
         }
@@ -500,7 +524,7 @@ struct stordb_blk_h *db_find_blk_for_rec(struct stordb *db, struct stordb_tbl *t
 static int db_blk_add_rec(struct stordb *db, struct stordb_blk_h *blkh, struct stordb_rec *rec) {
     size_t recsz_total = rec->header.rech_sz+rec->header.rec_sz;
     ASSERT(blkh->bh_free >= recsz_total);
-    void *writestart;
+    char *writestart = NULL;
     off_t rec_offset;
     if (blkh->bh_num_records == 0) {
         rec_offset = STOR_BLKSIZ - recsz_total;
@@ -508,9 +532,16 @@ static int db_blk_add_rec(struct stordb *db, struct stordb_blk_h *blkh, struct s
         rec_offset = blkh->bh_record_offsets[blkh->bh_num_records-1] - recsz_total;
         ASSERT(rec_offset > 0 && rec_offset < STOR_BLKSIZ);
     }
-    writestart = blkh+rec_offset;
+    DEBUG(DBG_ADD, "Writing record (%lu bytes) at offset: %ld\n", recsz_total, rec_offset);
+    DEBUG(DBG_ADD, "Writing record, blkh ptr: %p\n", blkh);
+    DEBUG(DBG_ADD, "Writing record, blkh ptr+offset: %p\n", ((char*)blkh)+rec_offset);
+    /*DEBUG(DBG_ADD, "Record header offset 0: %ld\n", rec->header.rec_offsets[0]);*/
+    /*DEBUG(DBG_ADD, "Record header offset 1: %ld\n", rec->header.rec_offsets[1]);*/
+    /*DEBUG(DBG_ADD, "First rec value: %d\n", *(int*)REC_VALUES_PTR(rec));*/
+    /*DEBUG(DBG_ADD, "Second rec value: %s\n", (char*)REC_VALUE_PTR(rec,1));*/
+    writestart = ((char*)blkh)+rec_offset;
     memcpy(writestart, rec, recsz_total);
-    blkh->bh_free -= recsz_total;
+    blkh->bh_free -= (recsz_total + 2); // add 2 bytes to account for storing offset (see below)
     blkh->bh_num_records++;
     blkh->bh_record_offsets[blkh->bh_num_records-1] = rec_offset;
     return 0;
@@ -560,28 +591,45 @@ static int db_add_record(struct stordb *db, const char *tblname, const char *row
         validx++;
         in = NULL;
     }
-    size_t rech_sz = sizeof(struct stordb_rec_h) + sizeof(off_t) * tbl->tbl_num_cols;
+    size_t rech_sz = sizeof(struct stordb_rec_h) + sizeof(off_t)*tbl->tbl_num_cols;
     struct stordb_rec_h *rech = malloc(rech_sz);
     ASSERT(rech);
+    memset(rech, 0, rech_sz);
     rech->rech_sz = rech_sz;
     rech->rec_sz = recsz_total;
     off_t *rec_offsets = rech->rec_offsets;
     off_t rec_off = 0;
     for (int i = 0; i < tbl->tbl_num_cols; i++) {
+        DEBUG(DBG_ADD, "Saving record offset: %ld for colidx %d\n", rec_off, i);
         rec_offsets[i] = rec_off;
         rec_off += val_sizes[i];
     }
     size_t recsz_all = rech_sz+rech->rec_sz;
     struct stordb_rec *rec = malloc(recsz_all);
     ASSERT(rec);
+    memset(rec, 0, recsz_all);
     memcpy(rec, rech, rech_sz);
-    free(rech);
-    unsigned char *rec_vals = rec->values;
+    ASSERT(rec->header.rech_sz == rech->rech_sz);
+    ASSERT(rec->header.rec_sz == rech->rec_sz);
+    char *rec_vals = REC_VALUES_PTR(rec);
     for (int i = 0; i < tbl->tbl_num_cols; i++) {
-        memcpy(rec_vals, vals+i, val_sizes[i]);
-        rec_vals += val_sizes[i]+1;
+        ASSERT(val_sizes[i] > 0);
+        switch (vals[i].type) {
+            case COLTYPE_VARCHAR:
+                DEBUG(DBG_ADD, "Copying string %s (%ld bytes) to record\n", vals[i].val.sval, val_sizes[i]);
+                memcpy(rec_vals, vals[i].val.sval, val_sizes[i]);
+                break;
+            case COLTYPE_INT:
+                DEBUG(DBG_ADD, "Copying int %d to record\n", vals[i].val.ival);
+                ASSERT(val_sizes[i] == sizeof(int));
+                memcpy(rec_vals, &(vals[i].val.ival), val_sizes[i]);
+                break;
+            default:
+                memcpy(rec_vals, &vals[i].val, val_sizes[i]);
+                break;
+        }
+        rec_vals += val_sizes[i];
     }
-    DEBUG(DBG_SCHEMA, "Finding blk for rec\n");
     struct stordb_blk_h *blkh = db_find_blk_for_rec(db, tbl, recsz_all, true);
     ASSERT(blkh);
     bool added_blk = blkh->bh_num_records == 0;
@@ -592,13 +640,176 @@ static int db_add_record(struct stordb *db, const char *tblname, const char *row
     return 0;
 }
 
+static bool record_val_matches(dbtval_t *recval, dbsrchval_t *srchval) {
+    ASSERT(recval->type == srchval->type && recval->type > COLTYPE_ERR);
+    switch(recval->type) {
+        case COLTYPE_INT:
+            DEBUG(DBG_SRCH, "FIND [INT] => recval: %d, srchval: %d\n", recval->val.ival, srchval->val.ival);
+            return recval->val.ival == srchval->val.ival;
+        case COLTYPE_CHAR:
+            DEBUG(DBG_SRCH, "FIND [CHAR] => recval: %c, srchval: %c\n", recval->val.cval, srchval->val.cval);
+            return recval->val.cval == srchval->val.cval;
+        case COLTYPE_VARCHAR:
+            DEBUG(DBG_SRCH, "FIND [VARCHAR] => recval: %s, srchval: %s\n", recval->val.sval, srchval->val.sval);
+            return strncmp(recval->val.sval, srchval->val.sval, STOR_VARCHAR_MAX) == 0;
+        case COLTYPE_DOUBLE:
+            DEBUG(DBG_SRCH, "FIND [DOUBLE] => recval: %f, srchval: %f\n", recval->val.dval, srchval->val.dval);
+            return recval->val.dval == srchval->val.dval;
+        default:
+            die("unreachable\n");
+            return false;
+    }
+}
+
+static bool db_record_matches(struct stordb_rec *rec, vec_dbsrchval_t *search_vals) {
+    dbsrchval_t *search_val;
+    int idx;
+    vec_foreach_ptr(search_vals, search_val, idx) {
+        off_t offset = rec->header.rec_offsets[search_val->col_idx];
+        if (search_val->col_idx > 0) {
+            ASSERT(offset > 0);
+        } else if (search_val->col_idx == 0) {
+            ASSERT(offset == 0);
+        }
+        dbtval_t tval;
+        tval.type = search_val->type;
+        dbval_t val;
+        DEBUG(DBG_SRCH, "record value offset for col idx %d: %ld\n", search_val->col_idx, offset);
+        if (tval.type == COLTYPE_VARCHAR) {
+            val = (dbval_t)REC_VALUE_PTR(rec, search_val->col_idx);
+        } else {
+            val = *(dbval_t*)REC_VALUE_PTR(rec, search_val->col_idx);
+        }
+        tval.val = val;
+        /*if (tval.type == COLTYPE_INT) {*/
+            /*DEBUG(DBG_SRCH, "record value for int: %d\n", tval.val.ival);*/
+        /*}*/
+        /*if (tval.type == COLTYPE_VARCHAR) {*/
+            /*DEBUG(DBG_SRCH, "record value for string: %s\n", tval.val.sval);*/
+        /*}*/
+        if (!record_val_matches(&tval, search_val)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int sort_by_colidx_fn(const void *val1, const void *val2) {
+    if (((dbsrchval_t*)val1)->col_idx < ((dbsrchval_t*)val2)->col_idx) {
+        return -1;
+    } else {
+        return 1;
+    }
+}
+
+static void db_sort_srchvals(struct stordb_tbl *tbl, vec_dbsrchval_t *search_vals) {
+    (void)tbl;
+    vec_sort(search_vals, sort_by_colidx_fn);
+}
+
+static struct stordb_rec *db_find_record(struct stordb *db, const char *tblname, const char *rowvals, dberr_t *dberr) {
+    struct stordb_tbl *cur = NULL;
+    struct stordb_tbl *tbl = NULL;
+    int i = 0;
+    vec_foreach(&db->db_meta.mt_tbls, cur, i) {
+        if (strcmp(cur->tbl_name, tblname) == 0) {
+            tbl = cur;
+            break;
+        }
+    }
+    if (!tbl) {
+        *dberr = DBERR_TBLNAME_NOEXIST;
+        db_set_lasterr(db, dberr, strndup(tblname, STOR_TBLNAME_MAX));
+        return NULL;
+    }
+    const char *colvalsep = "=";
+    const char *valcolsep = ",";
+    char *tok = NULL;
+    char *in = (char*)rowvals;
+    int idx = 0;
+    int colidx;
+    struct stordb_col *col = NULL;
+    vec_dbsrchval_t search_vals;
+    vec_init(&search_vals);
+    while ((tok = strtok(in, idx % 2 == 0 ? colvalsep : valcolsep)) != NULL) {
+        // parse column name
+        if (idx % 2 == 0) {
+            col = db_colname(tbl, tok, &colidx);
+            if (!col) {
+                *dberr = DBERR_COLNAME_NOEXIST;
+                db_set_lasterr(db, dberr, strndup(tok, STOR_COLNAME_MAX));
+                vec_deinit(&search_vals);
+                return NULL;
+            }
+        // parse record value
+        } else {
+            dbtval_t tval;
+            dbsrchval_t srchval;
+            dberr_t deser_err;
+            int res = db_deserialize_val(db, tok, col->col_type, &tval, NULL, &deser_err);
+            if (res == -1) {
+                *dberr = deser_err;
+                vec_deinit(&search_vals);
+                return NULL;
+            }
+            srchval.tbl_id = tbl->tbl_id;
+            srchval.col_id = col->col_id;
+            srchval.col_idx = colidx;
+            srchval.val = tval.val;
+            srchval.type = tval.type;
+            vec_push(&search_vals, srchval);
+        }
+        idx++;
+        in = NULL;
+    }
+
+    // "col1=val1,col2=", we're missing a value
+    if (idx % 2 != 0) {
+        *dberr = DBERR_MISSING_FIND_VALUE;
+        db_set_lasterr(db, dberr, strndup(col->col_name, STOR_COLNAME_MAX));
+        vec_deinit(&search_vals);
+        return NULL;
+    }
+
+    db_sort_srchvals(tbl, &search_vals);
+
+    // go over blocks and try to find record that matches qualifiers, 1 record at a time... (naive)
+    uint16_t blkno;
+    int blkidx = 0;
+    struct stordb_blk_h *blk;
+    struct stordb_rec *found = NULL;
+    vec_foreach(&tbl->tbl_blks, blkno, blkidx) {
+        blk = db_load_blk(db, blkno);
+        ASSERT(blk);
+        if (blk->bh_num_records == 0) {
+            continue;
+        }
+        struct stordb_rec *rec;
+        int recidx = 0;
+        BLK_RECORDS_FOREACH(blk, rec, recidx) {
+            DEBUG(DBG_SRCH, "Record %d\n", recidx);
+            DEBUG(DBG_SRCH, "  Block record offset: %u\n", blk->bh_record_offsets[recidx]);
+            DEBUG(DBG_SRCH, "  Record found, rech_sz=%lu\n", rec->header.rech_sz);
+            DEBUG(DBG_SRCH, "  Record found, rec_sz=%lu\n", rec->header.rec_sz);
+            /*DEBUG(DBG_SRCH, "  Record found, offset[0]=%ld\n", rec->header.rec_offsets[0]);*/
+            /*DEBUG(DBG_SRCH, "  Record found, offset[1]=%ld\n", rec->header.rec_offsets[1]);*/
+            if (db_record_matches(rec, &search_vals)) {
+                found = rec;
+                vec_deinit(&search_vals);
+                return found;
+            }
+        }
+    }
+    return NULL;
+}
+
 static int db_close(struct stordb *db) {
-    DEBUG(DBG_SCHEMA, "Closing db\n");
+    DEBUG(DBG_STATE, "Closing db\n");
     if (db->db_fd <= 0) {
         return -1;
     }
     if (db->db_mt_dirty) {
-        DEBUG(DBG_SCHEMA, "Flushing metainfo (dirty)\n");
+        DEBUG(DBG_SCHEMA|DBG_STATE, "Flushing metainfo on close (dirty)\n");
         db_flush_meta(db);
     }
     int close_res = close(db->db_fd);
@@ -620,9 +831,7 @@ int db_init(struct stordb *db) {
 }
 
 int main(int argc, char *argv[]) {
-    stor_dbgflags = 0;
-    stor_dbgflags |= DBG_SCHEMA;
-    stor_dbgflags |= DBG_INSERT;
+    stor_dbgflags = DBG_ALL;
 
     if (argc <= 2) {
         die("Usage: stor [create|addtbl|addrec|load] dbname [OPTIONS]\n");
@@ -632,7 +841,7 @@ int main(int argc, char *argv[]) {
     const char *tblname = NULL;
     const char *tblcols = NULL;
     const char *rowvals = NULL;
-    enum stor_cmd cmd = CMD_FIND;
+    enum stor_cmd cmd = CMD_LOAD;
     if (strcmp(cmd_str, "create") == 0) {
         cmd = CMD_CREATE;
     } else if (strcmp(cmd_str, "load") == 0) {
@@ -651,12 +860,20 @@ int main(int argc, char *argv[]) {
         }
         tblname = argv[3];
         rowvals = argv[4];
+    } else if (strcmp(cmd_str, "find") == 0) {
+        cmd = CMD_FIND;
+        if (argc != 5) {
+            die("Usage: stor find dbname tblname col1=val,col2=val2...\n");
+        }
+        tblname = argv[3];
+        rowvals = argv[4];
     }
     switch (cmd) {
         case CMD_CREATE:
         case CMD_LOAD:
         case CMD_ADDTBL:
         case CMD_ADDREC:
+        case CMD_FIND:
             break;
         default:
             die("Unsupported command: %s\n", cmd_str);
@@ -670,7 +887,7 @@ int main(int argc, char *argv[]) {
     db.db_fname = dbname;
     db.db_meta = dbmeta;
     if (cmd == CMD_CREATE) {
-        dbmeta.mt_magic = STOR_META_MAGIC;
+        db.db_meta.mt_magic = STOR_META_MAGIC;
         db.db_mt_dirty = true;
         int res = db_init(&db);
         if (res != 0) {
@@ -678,9 +895,9 @@ int main(int argc, char *argv[]) {
         }
         res = db_flush_meta(&db);
         if (res != 0) {
-            die("Couldn't flush db: %s\n", strerror(errno));
+            die("Couldn't flush db metainfo: %s\n", strerror(errno));
         }
-        db_close(&db);
+        ASSERT(db_close(&db) == 0);
         return res;
     } else if (cmd == CMD_LOAD) {
         int res = db_load(&db);
@@ -738,6 +955,22 @@ int main(int argc, char *argv[]) {
         int add_rec_res = db_add_record(&db, tblname, rowvals, &dberr);
         if (add_rec_res == -1) {
             die("Couldn't add record: %s\n", dbstrerr(dberr));
+        }
+        db_close(&db);
+        return res;
+    } else if (cmd == CMD_FIND) {
+        int res = db_load(&db);
+        if (res != 0) {
+            die("Couldn't load db: %s\n", strerror(errno));
+        }
+        DEBUG(DBG_SCHEMA, "Loaded DB\n");
+        dberr_t dberr;
+        struct stordb_rec *found = NULL;
+        found = db_find_record(&db, tblname, rowvals, &dberr);
+        if (!found) {
+            die("Couldn't find record\n", dbstrerr(dberr));
+        } else {
+            fprintf(stdout, "Found record\n");
         }
         db_close(&db);
         return res;

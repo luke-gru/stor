@@ -1,6 +1,9 @@
 #ifndef _STOR_H_
 #define _STOR_H_
 
+// for strnlen
+#define _POSIX_C_SOURCE 200809L
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -54,9 +57,11 @@ typedef enum dberr_t {
     DBERR_TBLNAME_EXISTS,
     DBERR_TBLNAME_NOEXIST,
     DBERR_COLNAME_TOO_LONG,
+    DBERR_COLNAME_NOEXIST,
     DBERR_COLTYPE_INVALID,
     DBERR_TOO_MANY_REC_VALUES,
     DBERR_VAL_OUT_OF_RANGE,
+    DBERR_MISSING_FIND_VALUE,
 } dberr_t;
 
 
@@ -70,8 +75,19 @@ typedef union dbval {
 // tagged value type
 typedef struct dbtval {
     dbval_t val;
-    enum stor_coltype type;
+    coltype_t type;
 } dbtval_t;
+typedef vec_t(dbtval_t) vec_dbtval_t;
+
+// tagged value type for a specific table and column, used in searches
+typedef struct dbsrchval {
+    tblid_t tbl_id;
+    colid_t col_id;
+    int col_idx;
+    dbval_t val;
+    coltype_t type;
+} dbsrchval_t;
+typedef vec_t(dbsrchval_t) vec_dbsrchval_t;
 
 static inline const char const *dbstrerr(dberr_t err) {
     switch (err) {
@@ -85,12 +101,16 @@ static inline const char const *dbstrerr(dberr_t err) {
         return "Table doesn't exist with that name";
     case DBERR_COLNAME_TOO_LONG:
         return "Column name too long";
+    case DBERR_COLNAME_NOEXIST:
+        return "Column doesn't exist";
     case DBERR_COLTYPE_INVALID:
         return "Column type invalid";
     case DBERR_TOO_MANY_REC_VALUES:
         return "Too many record values";
     case DBERR_VAL_OUT_OF_RANGE:
         return "Value out of range";
+    case DBERR_MISSING_FIND_VALUE:
+        return "Missing value for find";
     default:
         return "Unknown";
     }
@@ -122,7 +142,7 @@ struct stordb_tbl {
 
 typedef vec_t(struct stordb_tbl*) vec_tblp_t;
 
-#define DB_META_SER_BYTES(metap) (sizeof(*metap) - sizeof(vec_tblp_t))
+#define DB_META_SER_BYTES(metap) (sizeof(*metap) - sizeof((metap)->mt_tbls))
 struct stordb_meta {
     uint16_t mt_magic;
     uint16_t mt_num_tables;
@@ -159,16 +179,23 @@ struct stordb {
     struct stordb_meta db_meta;
 };
 
+#define REC_VALUES_PTR(recp) (((char*)(recp))+(recp->header.rech_sz))
+#define REC_VALUE_PTR(recp,n) (((char*)(recp))+(recp->header.rech_sz+recp->header.rec_offsets[n]))
 struct stordb_rec_h {
     size_t rech_sz; // size of record header
     size_t rec_sz; // size of record not including the header
-    off_t rec_offsets[];
+    off_t rec_offsets[]; // values[] offsets for sorted columns
 } PACKED;
 struct stordb_rec {
     struct stordb_rec_h header;
     unsigned char values[];
 } PACKED;
 
+#define BLK_RECORDS_FOREACH(blkh, var, idx)\
+for ((idx) = 0;\
+    ((idx) < (blkh)->bh_num_records) &&\
+    (var = (struct stordb_rec*)(((char*)(blkh))+blkh->bh_record_offsets[idx]));\
+    idx++)
 
 void die(const char *fmt, ...);
 int init_db(struct stordb*);
