@@ -445,6 +445,7 @@ static blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
     int res = db_write(db, blk, STOR_BLKSIZ);
     if (res <= 0) return NULL;
     vec_push(&tbl->tbl_blks, num);
+    vec_push(&db->db_blkcache, blk);
     tbl->tbl_num_blks++;
     return blk;
 }
@@ -460,7 +461,7 @@ static int db_flush_blk(db_t *db, blkh_t *blk) {
     return 0;
 }
 
-static int db_flush_dirty_blks(db_t *db) {
+int db_flush_dirty_blks(db_t *db) {
     int blkno, i;
     blkh_t *blk;
     vec_foreach(&db->db_blksdirty, blkno, i) {
@@ -481,12 +482,14 @@ static int db_flush_dirty_blks(db_t *db) {
     return 0;
 }
 
+// TODO: make smarter! Use cached blocks first before loading sequential blocks
 blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk) {
     ASSERT(recsz < STOR_BLKSIZ); // TODO: implement record fragments across blocks
     blkh_t *found = NULL;
     blkh_t *blk = NULL;
     uint16_t num = 1;
     do {
+        // FIXME: we need a block for this specific table, not just any block!
         blk = db_load_blk(db, num);
         if (blk == NULL || blk->bh_magic != STOR_BLKH_MAGIC) {
             break;
@@ -543,6 +546,14 @@ static int db_blk_add_rec(db_t *db, blkh_t *blkh, rec_t *rec) {
     blkh->bh_num_records++;
     blkh->bh_record_offsets[blkh->bh_num_records-1] = rec_offset;
     return 0;
+}
+
+static void db_mark_blk_dirty(db_t *db, blkh_t *blk) {
+    int idx = 0;
+    vec_find(&db->db_blksdirty, (int)blk->bh_blkno, idx);
+    if (idx == -1) {
+        vec_push(&db->db_blksdirty, (int)blk->bh_blkno);
+    }
 }
 
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr) {
@@ -644,6 +655,8 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     if (flushblk) {
         DEBUG(DBG_ADD, "flushing blk for new record\n");
         db_flush_blk(db, blkh);
+    } else {
+        db_mark_blk_dirty(db, blkh);
     }
     db->db_mt_dirty = isnewblk;
     return 0;
@@ -857,13 +870,6 @@ static size_t dbval_sz(dbval_t *val, coltype_t type) {
     }
 }
 
-static void db_mark_blk_dirty(db_t *db, blkh_t *blk) {
-    int idx = 0;
-    vec_find(&db->db_blksdirty, (int)blk->bh_blkno, idx);
-    if (idx == -1) {
-        vec_push(&db->db_blksdirty, (int)blk->bh_blkno);
-    }
-}
 
 /*static void db_unmark_blk_dirty(db_t *db, blkh_t *blk) {*/
     /*vec_remove(&db->db_blksdirty, (int)blk->bh_blkno);*/
@@ -967,10 +973,10 @@ int db_close(db_t *db) {
     db->db_fd = 0;
     db->db_num_writes = 0;
     db->db_offset = 0;
-    /*db->db_mt_dirty = false;*/
-    /*vec_clear(&db->db_blkcache);*/
-    /*vec_clear(&db->db_blksdirty);*/
-    /*memset(&db->db_meta, 0, sizeof(db->db_meta));*/
+    db->db_mt_dirty = false;
+    vec_clear(&db->db_blkcache);
+    vec_clear(&db->db_blksdirty);
+    memset(&db->db_meta, 0, sizeof(db->db_meta));
     return 0;
 }
 

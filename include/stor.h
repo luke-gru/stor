@@ -239,6 +239,7 @@ blkh_t *db_load_blk(db_t *db, uint16_t num);
 tbl_t *db_table(db_t *db, int i);
 col_t *db_col(tbl_t *tbl, int i);
 int db_flush_meta(db_t *db);
+int db_flush_dirty_blks(db_t *db);
 
 const char *coltype_str(coltype_t coltype);
 

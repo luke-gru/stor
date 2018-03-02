@@ -13,12 +13,14 @@
 extern int assertions_passed;
 extern int assertions_failed;
 extern int tests_passed;
+extern int tests_skipped;
 extern int tests_failed;
 
 static inline void START_TESTS(void) {
     assertions_passed = 0;
     assertions_failed = 0;
     tests_passed = 0;
+    tests_skipped = 0;
     tests_failed = 0;
 }
 
@@ -53,6 +55,12 @@ static inline void _RUN_TEST(int (*test_fn)(void), const char *fnname) {
     } else {
         tests_failed++;
     }
+}
+
+#define SKIP_TEST(testfn) _SKIP_TEST(#testfn)
+static inline void _SKIP_TEST(const char *fnname) {
+    DEBUG(DBG_TEST, "-- Skipping %s --\n", fnname);
+    tests_skipped++;
 }
 
 #define T_ASSERT(expr) ((expr) ? PASS_ASSERT() : FAIL_ASSERT(__FILE__, __LINE__, __func__))
