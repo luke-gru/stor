@@ -18,7 +18,7 @@
 #include <limits.h>
 #include <math.h>
 #include "debug.h"
-#include "strdup.h"
+#include "kstrdup.h"
 #include "vec.h"
 
 #define ASSERT(expr) ((expr) ? (void)0 : die("assertion failure (%s:%d) in %s\n", __FILE__, __LINE__, __func__))

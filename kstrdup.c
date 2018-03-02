@@ -1,8 +1,8 @@
 #include <stdlib.h>
 #include <string.h>
-#include "strdup.h"
+#include "kstrdup.h"
 
-char *strdup(const char *s) {
+char *kstrdup(const char *s) {
     size_t size = strlen(s) + 1;
     char *p = malloc(size);
     if (p != NULL) {
@@ -11,7 +11,7 @@ char *strdup(const char *s) {
     return p;
 }
 
-char *strndup(const char *s, size_t n) {
+char *kstrndup(const char *s, size_t n) {
     char *p = memchr(s, '\0', n);
     if (p != NULL)
         n = p - s;

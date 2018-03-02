@@ -241,7 +241,7 @@ const char *coltype_str(coltype_t coltype) {
 int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *dberr) {
     if (strnlen(tblname, STOR_TBLNAME_MAX)+1 > STOR_TBLNAME_MAX) {
         *dberr = DBERR_TBLNAME_TOO_LONG;
-        db_set_lasterr(db, dberr, strndup(tblname, STOR_TBLNAME_MAX));
+        db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
         return -1;
     }
     int num_tbls = db->db_meta.mt_num_tables;
@@ -251,7 +251,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
         ASSERT(tbl->tbl_id > 0);
         if (strcmp(tblname, tbl->tbl_name) == 0) {
             *dberr = DBERR_TBLNAME_EXISTS;
-            db_set_lasterr(db, dberr, strndup(tblname, STOR_TBLNAME_MAX));
+            db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
             return -1;
         }
         if (tbl->tbl_id >= new_id) {
@@ -287,7 +287,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
         if (colnamelen > STOR_COLNAME_MAX) {
             err = true;
             *dberr = DBERR_COLNAME_TOO_LONG;
-            db_set_lasterr(db, dberr, strndup(colbeg, STOR_COLNAME_MAX));
+            db_set_lasterr(db, dberr, kstrndup(colbeg, STOR_COLNAME_MAX));
             break;
         }
         size_t coltypelen = STOR_COLTYPE_MAX;
@@ -315,7 +315,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
         if (col_type == COLTYPE_ERR) {
             LOG_ERR("Invalid column type: %s\n", coltypebuf);
             *dberr = DBERR_COLTYPE_INVALID;
-            db_set_lasterr(db, dberr, strndup(coltypebuf, coltypelen));
+            db_set_lasterr(db, dberr, kstrndup(coltypebuf, coltypelen));
             err = true;
             break;
         }
@@ -346,7 +346,7 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
             if (val < INT_MIN || val > INT_MAX) {
                 DEBUG(DBG_DESER, "int out of range: %s\n", dbval);
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
-                db_set_lasterr(db, dberr, strndup(dbval, 12));
+                db_set_lasterr(db, dberr, kstrndup(dbval, 12));
                 return -1;
             }
             int ival = (int)val;
@@ -361,7 +361,7 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
             if (strnlen(dbval, 2) > 1) {
                 DEBUG(DBG_DESER, "char out of range: %s\n", dbval);
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
-                db_set_lasterr(db, dberr, strndup(dbval, 10));
+                db_set_lasterr(db, dberr, kstrndup(dbval, 10));
                 return -1;
             }
             tval->val = (dbval_t)c;
@@ -374,7 +374,7 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
             size_t len = strnlen(dbval, STOR_VARCHAR_MAX+1);
             if (len > STOR_VARCHAR_MAX) {
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
-                db_set_lasterr(db, dberr, strndup(dbval, STOR_VARCHAR_MAX));
+                db_set_lasterr(db, dberr, kstrndup(dbval, STOR_VARCHAR_MAX));
                 return -1;
             }
             tval->val = (dbval_t)dbval;
@@ -387,7 +387,7 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
             double val = strtod(dbval, NULL);
             if ((val == 0 || val == HUGE_VALF) && errno == ERANGE) {
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
-                db_set_lasterr(db, dberr, strndup(dbval, 12));
+                db_set_lasterr(db, dberr, kstrndup(dbval, 12));
                 return -1;
             }
             tval->val = (dbval_t)val;
@@ -554,7 +554,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     }
     if (!tbl) {
         *dberr = DBERR_TBLNAME_NOEXIST;
-        db_set_lasterr(db, dberr, strndup(tblname, STOR_TBLNAME_MAX));
+        db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
         return -1;
     }
     char *tok = NULL;
@@ -567,7 +567,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         col_t *col = db_col(tbl, validx);
         if (!col) {
             *dberr = DBERR_TOO_MANY_REC_VALUES;
-            db_set_lasterr(db, dberr, strndup(tok, 100));
+            db_set_lasterr(db, dberr, kstrndup(tok, 100));
             return -1;
         }
         dbtval_t tval;
@@ -741,7 +741,7 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
             col = db_colname(tbl, tok, &colidx);
             if (!col) {
                 *dberr = DBERR_COLNAME_NOEXIST;
-                db_set_lasterr(db, dberr, strndup(tok, STOR_COLNAME_MAX));
+                db_set_lasterr(db, dberr, kstrndup(tok, STOR_COLNAME_MAX));
                 return -1;
             }
         // parse record value
@@ -768,7 +768,7 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
     // "col1=val1,col2=", we're missing a value
     if (idx % 2 != 0) {
         *dberr = DBERR_MISSING_FIND_VALUE;
-        db_set_lasterr(db, dberr, strndup(col->col_name, STOR_COLNAME_MAX));
+        db_set_lasterr(db, dberr, kstrndup(col->col_name, STOR_COLNAME_MAX));
         return -1;
     }
 
