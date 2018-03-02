@@ -4,7 +4,11 @@ ODIR=build
 
 .PHONY: stor
 stor: build
-	$(CC) $(CFLAGS) main.c strdup.c vec.c -o $(ODIR)/stor
+	$(CC) $(CFLAGS) main.c db.c strdup.c vec.c -o $(ODIR)/stor
+
+.PHONY: test
+test: build
+	$(CC) $(CFLAGS) test.c db.c strdup.c vec.c -o $(ODIR)/test
 
 build:
 	mkdir $(ODIR)

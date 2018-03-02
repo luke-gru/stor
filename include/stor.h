@@ -18,7 +18,6 @@
 #include <limits.h>
 #include <math.h>
 #include "debug.h"
-#include "list.h"
 #include "strdup.h"
 #include "vec.h"
 
@@ -223,6 +222,23 @@ for ((idx) = 0;\
     idx++)
 
 void die(const char *fmt, ...);
-int init_db(struct stordb*);
+int db_init(db_t *db);
+int db_load(db_t *db);
+int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *dberr);
+blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk);
+int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr);
+int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrchcrit_t *vsearch_crit, dberr_t *dberr);
+tbl_t *db_find_table(db_t *db, const char *tblname);
+int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchopt_t *options, vec_recinfo_t *vrecinfo_out, dberr_t *dberr);
+int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupdate_info, dberr_t *dberr);
+int db_delete_records(db_t *db, vec_recinfo_t *vrecinfo, dberr_t *dberr);
+int db_find_record(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, recinfo_t *recinfo_out, dberr_t *dberr);
+blkh_t *db_load_blk(db_t *db, uint16_t num);
+tbl_t *db_table(db_t *db, int i);
+col_t *db_col(tbl_t *tbl, int i);
+int db_flush_meta(db_t *db);
+int db_close(db_t *db);
+
+const char *coltype_str(coltype_t coltype);
 
 #endif
