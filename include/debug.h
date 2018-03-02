@@ -18,6 +18,13 @@
 extern uint32_t stor_dbgflags;
 
 #define LOG_ERR(...) (fprintf(stderr, "[ERROR] " __VA_ARGS__))
+
+#ifndef NDEBUG
 #define DEBUG(d, ...) ((stor_dbgflags & (d)) ? fprintf(stderr, "[DEBUG] " __VA_ARGS__) : 0)
+#define DEBUGASSERT(expr) ASSERT(expr)
+#else
+#define DEBUG(d, ...) (void(0))
+#define DEBUGASSERT(expr) ((void)0)
+#endif
 
 #endif

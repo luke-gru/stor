@@ -39,6 +39,8 @@ typedef enum stor_cmd {
     CMD_LOAD,
     CMD_ADDTBL,
     CMD_ADDREC,
+    CMD_UPDATE,
+    CMD_DELETE,
 } cmd_t;
 
 typedef enum stor_coltype {
@@ -80,19 +82,31 @@ typedef struct dbtval {
 typedef vec_t(dbtval_t) vec_dbtval_t;
 
 // tagged value type for a specific table and column, used in searches
-typedef struct dbsrchval {
+typedef struct dbsrchcrit {
     tblid_t tbl_id;
     colid_t col_id;
     int col_idx;
     dbval_t val;
     coltype_t type;
-} dbsrchval_t;
-typedef vec_t(dbsrchval_t) vec_dbsrchval_t;
+} dbsrchcrit_t;
+typedef vec_t(dbsrchcrit_t) vec_dbsrchcrit_t;
+
+typedef struct dbsrchopt {
+    unsigned long limit;
+} srchopt_t;
+
+typedef struct dbupdval {
+    tblid_t tbl_id;
+    colid_t col_id;
+    int col_idx;
+    dbval_t newval;
+    ssize_t size_diff;
+    coltype_t type;
+} dbupdval_t;
+typedef vec_t(dbupdval_t) vec_dbupdval_t;
 
 static inline const char const *dbstrerr(dberr_t err) {
     switch (err) {
-    case DBERR_UNKNOWN:
-        return "Unknown";
     case DBERR_TBLNAME_TOO_LONG:
         return "Table name too long";
     case DBERR_TBLNAME_EXISTS:
@@ -118,11 +132,11 @@ static inline const char const *dbstrerr(dberr_t err) {
 
 
 #define DB_COL_SER_BYTES(colp) (sizeof(*colp))
-struct stordb_col {
+typedef struct stordb_col {
     colid_t col_id;
     coltype_t col_type;
     char col_name[STOR_COLNAME_MAX];
-} PACKED;
+} PACKED col_t;
 
 typedef vec_t(struct stordb_col) vec_col_t;
 typedef vec_t(uint16_t) vec_blknum_t;
@@ -131,65 +145,76 @@ typedef vec_t(uint16_t) vec_blknum_t;
 #define DB_TBL_SER_BYTES_POSTLOAD(tblp) (\
         DB_TBL_SER_BYTES_PRELOAD(tblp)+(tblp->tbl_num_cols*sizeof(struct stordb_col))\
         +(tblp->tbl_num_blks*sizeof(uint16_t)))
-struct stordb_tbl {
+typedef struct stordb_tbl {
     tblid_t tbl_id;
     char tbl_name[STOR_TBLNAME_MAX];
     uint16_t tbl_num_cols;
     uint16_t tbl_num_blks;
     vec_col_t tbl_cols;
     vec_blknum_t tbl_blks;
-} PACKED;
+} PACKED tbl_t;
 
 typedef vec_t(struct stordb_tbl*) vec_tblp_t;
 
 #define DB_META_SER_BYTES(metap) (sizeof(*metap) - sizeof((metap)->mt_tbls))
-struct stordb_meta {
+typedef struct stordb_meta {
     uint16_t mt_magic;
     uint16_t mt_num_tables;
     size_t mt_sersize; // meta info serialized size, including all serialized tables
     vec_tblp_t mt_tbls;
-} PACKED;
+} PACKED meta_t;
 
-struct db_tagged_err {
+typedef struct db_tagged_err {
     dberr_t err;
     char *msg;
-};
+} dbterr_t;
 
 // block header
 // Since records are not fixed length, they're added to the end of
 // the block first, and grow up towards the header as they're added.
-struct stordb_blk_h {
+typedef struct stordb_blk_h {
     uint16_t bh_magic;
-    uint16_t bh_blknum;
+    uint16_t bh_blkno;
     tblid_t bh_tbl_id;
     uint16_t bh_free;
     uint16_t bh_num_records;
     uint16_t bh_record_offsets[];
-} PACKED;
+} PACKED blkh_t;
 
 typedef vec_t(struct stordb_blk_h*) vec_blkp_t;
 
-struct stordb {
+typedef struct stordb {
     const char *db_fname;
     int db_fd;
     off_t db_offset;
     bool db_mt_dirty;
     struct db_tagged_err db_lasterr;
     vec_blkp_t db_blkcache;
+    vec_int_t db_blksdirty;
     struct stordb_meta db_meta;
-};
+} db_t;
 
 #define REC_VALUES_PTR(recp) (((char*)(recp))+(recp->header.rech_sz))
 #define REC_VALUE_PTR(recp,n) (((char*)(recp))+(recp->header.rech_sz+recp->header.rec_offsets[n]))
-struct stordb_rec_h {
+#define REC_SZ(recp) (recp->header.rech_sz+recp->header.rec_sz)
+#define REC_H_TOMBSTONE_VALUE (SIZE_MAX)
+#define REC_IS_TOMBSTONED(recp) (*(size_t*)recp == REC_H_TOMBSTONE_VALUE)
+typedef struct stordb_rec_h {
     size_t rech_sz; // size of record header
     size_t rec_sz; // size of record not including the header
     off_t rec_offsets[]; // values[] offsets for sorted columns
-} PACKED;
-struct stordb_rec {
+} PACKED rech_t;
+typedef struct stordb_rec {
     struct stordb_rec_h header;
     unsigned char values[];
-} PACKED;
+} PACKED rec_t;
+typedef vec_t(rec_t*) vec_recp_t;
+
+typedef struct stordb_recinfo {
+    blkh_t *blk;
+    rec_t *rec;
+} recinfo_t;
+typedef vec_t(recinfo_t) vec_recinfo_t;
 
 #define BLK_RECORDS_FOREACH(blkh, var, idx)\
 for ((idx) = 0;\

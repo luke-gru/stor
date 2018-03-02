@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-I./include -std=c99 -Wall -Werror
+CFLAGS=-I./include -std=c99 -Wall -Werror -g
 ODIR=build
 
 .PHONY: stor
