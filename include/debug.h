@@ -13,6 +13,7 @@
 #define DBG_DEL     0x00100
 
 #define DBG_ALL     0xFFFFF
+#define DBG_TEST    DBG_ALL
 #define DBG_NONE    0x00000
 
 extern uint32_t stor_dbgflags;

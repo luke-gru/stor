@@ -6,7 +6,9 @@
 #endif
 #include "debug.h"
 
+#ifndef STOR_TEST
 #define STOR_TEST 1
+#endif
 
 extern int assertions_passed;
 extern int assertions_failed;
@@ -41,7 +43,9 @@ static inline void PASS_ASSERT(void) {
     assertions_passed++;
 }
 
-static inline void RUN_TEST(int (*test_fn)(void)) {
+#define RUN_TEST(testfn) _RUN_TEST(testfn, #testfn)
+static inline void _RUN_TEST(int (*test_fn)(void), const char *fnname) {
+    DEBUG(DBG_TEST, "-- Running %s --\n", fnname);
     int old_failed = assertions_failed;
     int res = test_fn();
     if (res == 0 && old_failed == assertions_failed) {

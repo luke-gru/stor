@@ -45,6 +45,7 @@ static ssize_t db_write(db_t *db, void *buf, size_t bufsize) {
     if (res == -1) return res;
     if (res != bufsize) return -1;
     db->db_offset += res;
+    db->db_num_writes++;
     return res;
 }
 
@@ -107,6 +108,7 @@ static int db_load_next_table(db_t *db) {
 }
 
 static int db_load_meta(db_t *db) {
+    ASSERT(db->db_offset == 0);
     int res = db_read(db, &db->db_meta, DB_META_SER_BYTES(&db->db_meta));
     if (res == -1) return res;
     if (db->db_meta.mt_magic != STOR_META_MAGIC) {
@@ -121,12 +123,13 @@ static int db_load_meta(db_t *db) {
     return 0;
 }
 
-int db_load(db_t *db) {
+int db_open(db_t *db) {
     ASSERT(db->db_fname);
     ASSERT(db->db_fd == 0);
     int fd = open(db->db_fname, O_RDWR);
     if (fd == -1) return -1;
     db->db_fd = fd;
+    db_seek(db, SEEK_SET, 0);
     int load_res = db_load_meta(db);
     if (load_res != 0) return load_res;
     ASSERT(db->db_meta.mt_sersize > 0);
@@ -202,6 +205,7 @@ int db_flush_meta(db_t *db) {
     seek_res = db_seek(db, SEEK_SET, 4);
     if (seek_res != 0) return seek_res;
     write_res = write(db->db_fd, &db->db_meta.mt_sersize, sizeof(size_t));
+    // NOTE: db_num_writes not incremented here, it's fine, this is internal
     if (write_res == -1) return write_res;
     seek_res = db_seek(db, SEEK_SET, 0);
     if (seek_res != 0) return seek_res;
@@ -542,25 +546,27 @@ static int db_blk_add_rec(db_t *db, blkh_t *blkh, rec_t *rec) {
 }
 
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr) {
+    ASSERT(db);
+    ASSERT(tblname);
+    ASSERT(rowvals);
     const char *valsep = ",";
-    tbl_t *cur = NULL;
     tbl_t *tbl = NULL;
-    int i = 0;
-    vec_foreach(&db->db_meta.mt_tbls, cur, i) {
-        if (strcmp(cur->tbl_name, tblname) == 0) {
-            tbl = cur;
-            break;
-        }
-    }
+    tbl = db_find_table(db, tblname);
     if (!tbl) {
+        DEBUG(DBG_ADD, "!tbl\n");
         *dberr = DBERR_TBLNAME_NOEXIST;
         db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
         return -1;
     }
+    ASSERT(tbl->tbl_num_cols > 0);
     char *tok = NULL;
-    char *in = (char*)rowvals;
-    size_t val_sizes[tbl->tbl_num_cols];
-    dbtval_t vals[tbl->tbl_num_cols];
+    // strtok() doesn't work with string literals (modifies string)
+    char *rowvals_dup = kstrndup(rowvals, 100);
+    char *in = rowvals_dup;
+    /*size_t val_sizes[tbl->tbl_num_cols];*/
+    /*dbtval_t vals[tbl->tbl_num_cols];*/
+    size_t val_sizes[2];
+    dbtval_t vals[2];
     size_t recsz_total = 0;
     int validx = 0;
     while ((tok = strtok(in, valsep)) != NULL) {
@@ -568,6 +574,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         if (!col) {
             *dberr = DBERR_TOO_MANY_REC_VALUES;
             db_set_lasterr(db, dberr, kstrndup(tok, 100));
+            free(rowvals_dup);
             return -1;
         }
         dbtval_t tval;
@@ -576,6 +583,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         int res = db_deserialize_val(db, tok, col->col_type, &tval, &valsz, &deser_err);
         if (res == -1) {
             *dberr = deser_err;
+            free(rowvals_dup);
             return -1;
         }
         ASSERT(valsz > 0);
@@ -625,6 +633,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         rec_vals += val_sizes[i];
     }
     bool isnewblk = false;
+    DEBUG(DBG_ADD, "finding blk for rec\n");
     blkh_t *blkh = db_find_blk_for_rec(db, tbl, recsz_all, true, &isnewblk);
     ASSERT(blkh);
     if (blkh_out != NULL) {
@@ -633,6 +642,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     int add_res = db_blk_add_rec(db, blkh, rec);
     if (add_res != 0) return add_res;
     if (flushblk) {
+        DEBUG(DBG_ADD, "flushing blk for new record\n");
         db_flush_blk(db, blkh);
     }
     db->db_mt_dirty = isnewblk;
@@ -731,7 +741,9 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
     const char *colvalsep = "=";
     const char *valcolsep = ",";
     char *tok = NULL;
-    char *in = (char*)srchcrit_str;
+    // strtok() doesn't work with string literals (modifies string)
+    char *srchcrit_strdup = kstrndup(srchcrit_str, 100);
+    char *in = srchcrit_strdup;
     int idx = 0;
     int colidx;
     col_t *col = NULL;
@@ -953,10 +965,16 @@ int db_close(db_t *db) {
     int close_res = close(db->db_fd);
     if (close_res != 0) return close_res;
     db->db_fd = 0;
+    db->db_num_writes = 0;
+    db->db_offset = 0;
+    /*db->db_mt_dirty = false;*/
+    /*vec_clear(&db->db_blkcache);*/
+    /*vec_clear(&db->db_blksdirty);*/
+    /*memset(&db->db_meta, 0, sizeof(db->db_meta));*/
     return 0;
 }
 
-int db_init(db_t *db) {
+int db_create(db_t *db) {
     if (!db->db_fname) {
         return -1;
     }

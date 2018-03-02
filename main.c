@@ -79,7 +79,7 @@ int main(int argc, char *argv[]) {
     if (cmd == CMD_CREATE) {
         db.db_meta.mt_magic = STOR_META_MAGIC;
         db.db_mt_dirty = true;
-        int res = db_init(&db);
+        int res = db_create(&db);
         if (res != 0) {
             die("Couldn't initialize db: %s\n", strerror(errno));
         }
@@ -90,7 +90,7 @@ int main(int argc, char *argv[]) {
         ASSERT(db_close(&db) == 0);
         return res;
     } else if (cmd == CMD_LOAD) {
-        int res = db_load(&db);
+        int res = db_open(&db);
         if (res != 0) {
             die("Couldn't load db: %s\n", strerror(errno));
         }
@@ -123,7 +123,7 @@ int main(int argc, char *argv[]) {
         db_close(&db);
         return res;
     } else if (cmd == CMD_ADDTBL) {
-        int res = db_load(&db);
+        int res = db_open(&db);
         if (res != 0) {
             die("Couldn't load db: %s\n", strerror(errno));
         }
@@ -136,7 +136,7 @@ int main(int argc, char *argv[]) {
         db_close(&db);
         return res;
     } else if (cmd == CMD_ADDREC) {
-        int res = db_load(&db);
+        int res = db_open(&db);
         if (res != 0) {
             die("Couldn't load db: %s\n", strerror(errno));
         }
@@ -149,7 +149,7 @@ int main(int argc, char *argv[]) {
         db_close(&db);
         return res;
     } else if (cmd == CMD_FIND) {
-        int res = db_load(&db);
+        int res = db_open(&db);
         if (res != 0) {
             die("Couldn't load db: %s\n", strerror(errno));
         }
@@ -180,7 +180,7 @@ int main(int argc, char *argv[]) {
         db_close(&db);
         return (found ? 0 : 1);
     } else if (cmd == CMD_UPDATE) {
-        int res = db_load(&db);
+        int res = db_open(&db);
         if (res != 0) {
             die("Couldn't load db: %s\n", strerror(errno));
         }
@@ -227,7 +227,7 @@ int main(int argc, char *argv[]) {
         db_close(&db);
         return 0;
     } else if (cmd == CMD_DELETE) {
-        int res = db_load(&db);
+        int res = db_open(&db);
         if (res != 0) {
             die("Couldn't load db: %s\n", strerror(errno));
         }

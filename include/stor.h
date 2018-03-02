@@ -190,6 +190,7 @@ typedef struct stordb {
     struct db_tagged_err db_lasterr;
     vec_blkp_t db_blkcache;
     vec_int_t db_blksdirty;
+    unsigned db_num_writes;
     struct stordb_meta db_meta;
 } db_t;
 
@@ -222,8 +223,9 @@ for ((idx) = 0;\
     idx++)
 
 void die(const char *fmt, ...);
-int db_init(db_t *db);
-int db_load(db_t *db);
+int db_create(db_t *db);
+int db_open(db_t *db);
+int db_close(db_t *db);
 int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *dberr);
 blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk);
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr);
@@ -237,7 +239,6 @@ blkh_t *db_load_blk(db_t *db, uint16_t num);
 tbl_t *db_table(db_t *db, int i);
 col_t *db_col(tbl_t *tbl, int i);
 int db_flush_meta(db_t *db);
-int db_close(db_t *db);
 
 const char *coltype_str(coltype_t coltype);
 
