@@ -146,7 +146,7 @@ col_t *db_col(tbl_t *tbl, int i) {
     return &tbl->tbl_cols.data[i];
 }
 
-static col_t *db_colname(tbl_t *tbl, const char *name, int *colidx) {
+col_t *db_find_col(tbl_t *tbl, const char *name, int *colidx) {
     col_t *col;
     int i = 0;
     vec_foreach_ptr(&tbl->tbl_cols, col, i) {
@@ -196,8 +196,8 @@ int db_flush_meta(db_t *db) {
         }
         ASSERT(tblbufp - tblbuf == fulltbl_sz);
         write_res = db_write(db, tblbuf, fulltbl_sz);
+        free(tblbuf);
         if (write_res == -1) {
-            free(tblbuf);
             return write_res;
         }
     }
@@ -428,15 +428,16 @@ blkh_t *db_load_blk(db_t *db, uint16_t num) {
     return (blkh_t*)blk;
 }
 
-static blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
+// TODO: make sure block doesn't exist before writing over it!
+blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
     off_t offset = num * STOR_BLKSIZ;
     int seek_res = db_seek(db, SEEK_SET, offset);
     if (seek_res != 0) {
         return NULL;
     }
     struct stordb_blk_h *blk = malloc(STOR_BLKSIZ);
-    memset(blk, 0, STOR_BLKSIZ);
     ASSERT(blk);
+    memset(blk, 0, STOR_BLKSIZ);
     blk->bh_magic = STOR_BLKH_MAGIC;
     blk->bh_tbl_id = tbl->tbl_id;
     blk->bh_blkno = num;
@@ -447,6 +448,7 @@ static blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
     vec_push(&tbl->tbl_blks, num);
     vec_push(&db->db_blkcache, blk);
     tbl->tbl_num_blks++;
+    db->db_mt_dirty = true;
     return blk;
 }
 
@@ -482,19 +484,30 @@ int db_flush_dirty_blks(db_t *db) {
     return 0;
 }
 
-// TODO: make smarter! Use cached blocks first before loading sequential blocks
+static blkh_t *db_find_cached_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz) {
+    int i;
+    blkh_t *blk;
+    vec_foreach(&db->db_blkcache, blk, i) {
+        if (blk->bh_tbl_id == tbl->tbl_id && BLK_FITS_RECSZ(blk, recsz)) {
+            return blk;
+        }
+    }
+    return NULL;
+}
+
+// TODO: make smarter! Should have an index of blocks for tables somewhere
 blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk) {
     ASSERT(recsz < STOR_BLKSIZ); // TODO: implement record fragments across blocks
-    blkh_t *found = NULL;
+    blkh_t *found = db_find_cached_blk_for_rec(db, tbl, recsz);
+    if (found) return found;
     blkh_t *blk = NULL;
     uint16_t num = 1;
     do {
-        // FIXME: we need a block for this specific table, not just any block!
         blk = db_load_blk(db, num);
         if (blk == NULL || blk->bh_magic != STOR_BLKH_MAGIC) {
             break;
         }
-        if (blk->bh_free >= (recsz+2)) {
+        if (blk->bh_tbl_id == tbl->tbl_id && BLK_FITS_RECSZ(blk, recsz)) {
             found = blk;
             break;
         }
@@ -517,35 +530,7 @@ blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_no
 
 static bool db_blk_fits_rec(blkh_t *blkh, rec_t *rec) {
     size_t recsz_total = rec->header.rech_sz+rec->header.rec_sz;
-    return blkh->bh_free >= (recsz_total+2);
-}
-
-// Add a record to the in-memory representation of a data block. Caller must
-// check that there's room before calling.
-static int db_blk_add_rec(db_t *db, blkh_t *blkh, rec_t *rec) {
-    size_t recsz_total = rec->header.rech_sz+rec->header.rec_sz;
-    ASSERT(db_blk_fits_rec(blkh, rec));
-    char *writestart = NULL;
-    off_t rec_offset;
-    if (blkh->bh_num_records == 0) {
-        rec_offset = STOR_BLKSIZ - recsz_total;
-    } else {
-        rec_offset = blkh->bh_record_offsets[blkh->bh_num_records-1] - recsz_total;
-        ASSERT(rec_offset > 0 && rec_offset < STOR_BLKSIZ);
-    }
-    DEBUG(DBG_ADD, "Writing record (%lu bytes) at offset: %ld\n", recsz_total, rec_offset);
-    DEBUG(DBG_ADD, "Writing record, blkh ptr: %p\n", blkh);
-    DEBUG(DBG_ADD, "Writing record, blkh ptr+offset: %p\n", ((char*)blkh)+rec_offset);
-    /*DEBUG(DBG_ADD, "Record header offset 0: %ld\n", rec->header.rec_offsets[0]);*/
-    /*DEBUG(DBG_ADD, "Record header offset 1: %ld\n", rec->header.rec_offsets[1]);*/
-    /*DEBUG(DBG_ADD, "First rec value: %d\n", *(int*)REC_VALUES_PTR(rec));*/
-    /*DEBUG(DBG_ADD, "Second rec value: %s\n", (char*)REC_VALUE_PTR(rec,1));*/
-    writestart = ((char*)blkh)+rec_offset;
-    memcpy(writestart, rec, recsz_total);
-    blkh->bh_free -= (recsz_total + 2); // add 2 bytes to account for storing offset (see below)
-    blkh->bh_num_records++;
-    blkh->bh_record_offsets[blkh->bh_num_records-1] = rec_offset;
-    return 0;
+    return BLK_FITS_RECSZ(blkh, recsz_total);
 }
 
 static void db_mark_blk_dirty(db_t *db, blkh_t *blk) {
@@ -554,6 +539,73 @@ static void db_mark_blk_dirty(db_t *db, blkh_t *blk) {
     if (idx == -1) {
         vec_push(&db->db_blksdirty, (int)blk->bh_blkno);
     }
+}
+
+// Add a record to the in-memory representation of a data block. Caller must
+// check that there's room before calling.
+static int db_blk_add_rec(db_t *db, blkh_t *blk, rec_t *rec, rec_t **recout) {
+    size_t recsz_total = REC_SZ(rec);
+    ASSERT(db_blk_fits_rec(blk, rec));
+    char *cpystart = NULL;
+    off_t rec_offset;
+    if (blk->bh_num_records == 0) {
+        rec_offset = STOR_BLKSIZ - recsz_total;
+    } else {
+        rec_offset = blk->bh_record_offsets[blk->bh_num_records-1] - recsz_total;
+        ASSERT(rec_offset > 0 && rec_offset < STOR_BLKSIZ);
+    }
+    DEBUG(DBG_ADD, "Copying record (%lu bytes) at offset: %ld\n", recsz_total, rec_offset);
+    DEBUG(DBG_ADD, "Copying record, blkh ptr: %p\n", blk);
+    DEBUG(DBG_ADD, "Copying record, blkh ptr+offset: %p\n", ((char*)blk)+rec_offset);
+    /*DEBUG(DBG_ADD, "Record header offset 0: %ld\n", rec->header.rec_offsets[0]);*/
+    /*DEBUG(DBG_ADD, "Record header offset 1: %ld\n", rec->header.rec_offsets[1]);*/
+    /*DEBUG(DBG_ADD, "First rec value: %d\n", *(int*)REC_VALUES_PTR(rec));*/
+    /*DEBUG(DBG_ADD, "Second rec value: %s\n", (char*)REC_VALUE_PTR(rec,1));*/
+    cpystart = ((char*)blk)+rec_offset;
+    memcpy(cpystart, rec, recsz_total);
+    blk->bh_free -= (recsz_total + sizeof(uint16_t));
+    blk->bh_num_records++;
+    blk->bh_record_offsets[blk->bh_num_records-1] = rec_offset;
+    db_mark_blk_dirty(db, blk);
+    if (recout != NULL) {
+        *recout = (rec_t*)cpystart;
+    }
+    return 0;
+}
+
+static int REC_BLK_IDX(rec_t *rec, blkh_t *blk) {
+    for (int i = 0; i < blk->bh_num_records; i++) {
+        if (((char*)blk)+blk->bh_record_offsets[i] == (char*)rec) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Remove a record from the in-memory representation of a data block.
+static int db_blk_rm_rec(db_t *db, blkh_t *blk, rec_t *rec) {
+    ASSERT(BLK_CONTAINS_REC(blk, rec));
+    ASSERT(blk->bh_num_records > 0);
+    int recidx = REC_BLK_IDX(rec, blk);
+    ASSERT(recidx != -1);
+    int old_num_recs = (int)blk->bh_num_records;
+    blk->bh_num_records--;
+    size_t rec_sz = REC_SZ(rec);
+    blk->bh_free += (rec_sz+sizeof(uint16_t));
+    memset(rec, 0, rec_sz);
+    size_t tombstone_val = REC_H_TOMBSTONE_VALUE;
+    memcpy(rec, &tombstone_val, sizeof(size_t));
+    // Update the record offsets in the block header.
+    // Example: deleting recidx = 1, old_num_recs = 10
+    //   memmove(PTR+1, PTR+2, (10-2)*sizeof(uint16_t))
+    if (recidx != (old_num_recs-1)) {
+        memmove(blk->bh_record_offsets+recidx,
+                blk->bh_record_offsets+recidx+1,
+                ((old_num_recs-(recidx+1))*sizeof(uint16_t))
+               );
+    }
+    db_mark_blk_dirty(db, blk);
+    return 0;
 }
 
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr) {
@@ -650,7 +702,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     if (blkh_out != NULL) {
         *blkh_out = blkh;
     }
-    int add_res = db_blk_add_rec(db, blkh, rec);
+    int add_res = db_blk_add_rec(db, blkh, rec, NULL);
     if (add_res != 0) return add_res;
     if (flushblk) {
         DEBUG(DBG_ADD, "flushing blk for new record\n");
@@ -763,7 +815,7 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
     while ((tok = strtok(in, idx % 2 == 0 ? colvalsep : valcolsep)) != NULL) {
         // parse column name
         if (idx % 2 == 0) {
-            col = db_colname(tbl, tok, &colidx);
+            col = db_find_col(tbl, tok, &colidx);
             if (!col) {
                 *dberr = DBERR_COLNAME_NOEXIST;
                 db_set_lasterr(db, dberr, kstrndup(tok, STOR_COLNAME_MAX));
@@ -875,6 +927,31 @@ static size_t dbval_sz(dbval_t *val, coltype_t type) {
     /*vec_remove(&db->db_blksdirty, (int)blk->bh_blkno);*/
 /*}*/
 
+// Move record from old block to new block, tombstoning the space in the old block. There must be room in
+// newblk for the record, so the caller must check for this.
+int db_move_record(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, rec_t **recout, dberr_t *dberr) {
+    ASSERT(oldblk->bh_tbl_id == newblk->bh_tbl_id);
+    ASSERT(BLK_CONTAINS_REC(oldblk, rec));
+    ASSERT(oldblk != newblk);
+    ASSERT(db_blk_fits_rec(newblk, rec));
+    rec_t *new_rec = NULL;
+    int res = db_blk_add_rec(db, newblk, rec, &new_rec);
+    if (res != 0) {
+        // TODO: set dberr
+        (void)dberr;
+        return res;
+    }
+    ASSERT(BLK_CONTAINS_REC(newblk, new_rec));
+    res = db_blk_rm_rec(db, oldblk, rec);
+    if (res != 0) {
+        return res;
+    }
+    if (recout != NULL) {
+        *recout = new_rec;
+    }
+    return 0;
+}
+
 int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupdate_info, dberr_t *dberr) {
     recinfo_t *recinfo_p;
     int i = 0;
@@ -899,15 +976,6 @@ int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupda
     }
     db_flush_dirty_blks(db);
     return 0;
-}
-
-static int REC_BLK_IDX(rec_t *rec, blkh_t *blk) {
-    for (int i = 0; i < blk->bh_num_records; i++) {
-        if (((char*)blk)+blk->bh_record_offsets[i] == (char*)rec) {
-            return i;
-        }
-    }
-    return -1;
 }
 
 int db_delete_records(db_t *db, vec_recinfo_t *vrecinfo, dberr_t *dberr) {

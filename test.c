@@ -21,7 +21,7 @@ int test_open_close(void) {
 }
 
 int test_addtbl(void) {
-    T_ASSERT_EQ(0, db_open(testdb));
+    ASSERT(db_open(testdb) == 0);
     const char *tblname = "students";
     const char *tblcols = "id:int,name:varchar";
     dberr_t dberr;
@@ -32,12 +32,12 @@ int test_addtbl(void) {
     T_ASSERT_EQ(old_num_tbls+1, (int)testdb->db_meta.mt_num_tables);
     T_ASSERT(old_num_writes < testdb->db_num_writes);
     T_ASSERT(!testdb->db_mt_dirty);
-    T_ASSERT_EQ(0, db_close(testdb));
+    ASSERT(db_close(testdb) == 0);
     return 0;
 }
 
 int test_addrec_flushblk(void) {
-    T_ASSERT_EQ(0, db_open(testdb));
+    ASSERT(db_open(testdb) == 0);
     const char *tblname = "students";
     const char *rowvals = "1,Mel";
     dberr_t dberr;
@@ -46,12 +46,12 @@ int test_addrec_flushblk(void) {
     int add_rec_res = db_add_record(testdb, tblname, rowvals, NULL, flushblk, &dberr);
     T_ASSERT_EQ(0, add_rec_res);
     T_ASSERT(old_num_writes < testdb->db_num_writes);
-    T_ASSERT_EQ(0, db_close(testdb));
+    ASSERT(db_close(testdb) == 0);
     return 0;
 }
 
 int test_findrec(void) {
-    T_ASSERT_EQ(0, db_open(testdb));
+    ASSERT(db_open(testdb) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "id=1"; // exists
     tbl_t *tbl = db_find_table(testdb, tblname);
@@ -82,12 +82,90 @@ int test_findrec(void) {
     T_ASSERT_EQ(NULL, recinfo.rec);
     T_ASSERT_EQ(NULL, recinfo.blk);
 
-    T_ASSERT_EQ(0, db_close(testdb));
+    ASSERT(db_close(testdb) == 0);
+    return 0;
+}
+
+int test_update_single_value_same_size(void) {
+    ASSERT(db_open(testdb) == 0);
+    const char *tblname = "students";
+    const char *srchcrit_str = "name=Mel"; // exists
+    const char *updatevals_str = "name=Moo";
+
+    tbl_t *tbl = db_find_table(testdb, tblname);
+    vec_dbsrchcrit_t vsearch_crit;
+    vec_init(&vsearch_crit);
+    dberr_t dberr;
+    int res = db_parse_srchcrit(testdb, tbl, srchcrit_str, &vsearch_crit, &dberr);
+    T_ASSERT_EQ(0, res);
+
+    vec_dbsrchcrit_t vupdate_info;
+    vec_init(&vupdate_info);
+    res = db_parse_srchcrit(testdb, tbl, updatevals_str, &vupdate_info, &dberr);
+    T_ASSERT_EQ(0, res);
+
+    vec_recinfo_t recinfos;
+    vec_init(&recinfos);
+    srchopt_t findopts;
+    memset(&findopts, 0, sizeof(findopts));
+    res = db_find_records(testdb, tbl, &vsearch_crit, &findopts, &recinfos, &dberr);
+    T_ASSERT_EQ(0, res);
+    T_ASSERT_EQ(1, recinfos.length);
+    int num_writes_old = testdb->db_num_writes;
+    res = db_update_records(testdb, &recinfos, &vupdate_info, &dberr);
+    T_ASSERT_EQ(0, res);
+    T_ASSERT(testdb->db_num_writes > num_writes_old);
+    int colidx;
+    col_t *col = db_find_col(tbl, "name", &colidx);
+    T_ASSERT(col);
+    rec_t *rec = recinfos.data[0].rec;
+    T_ASSERT(rec);
+    T_ASSERT(strcmp((char*)REC_VALUE_PTR(rec, colidx), "Moo") == 0);
+
+    ASSERT(db_close(testdb) == 0);
+    return 0;
+}
+
+int test_move_record(void) {
+    ASSERT(db_open(testdb) == 0);
+    const char *tblname = "students";
+    const char *srchcrit_str = "id=1"; // exists
+    tbl_t *tbl = db_find_table(testdb, tblname);
+    vec_dbsrchcrit_t vsearch_crit;
+    vec_init(&vsearch_crit);
+    dberr_t dberr;
+    int res = db_parse_srchcrit(testdb, tbl, srchcrit_str, &vsearch_crit, &dberr);
+    T_ASSERT_EQ(0, res);
+    vec_recinfo_t recinfos;
+    vec_init(&recinfos);
+    srchopt_t findopts;
+    memset(&findopts, 0, sizeof(findopts));
+    res = db_find_records(testdb, tbl, &vsearch_crit, &findopts, &recinfos, &dberr);
+    T_ASSERT_EQ(0, res);
+    T_ASSERT_EQ(1, recinfos.length);
+
+    rec_t *oldrecp = recinfos.data[0].rec;
+    rec_t *newrecp = NULL;
+    blkh_t *oldblk = recinfos.data[0].blk;
+    int oldblk_num_recs = (int)oldblk->bh_num_records;
+    blkh_t *newblk = db_alloc_blk(testdb, oldblk->bh_blkno+1, tbl);
+    T_ASSERT(newblk);
+
+    res = db_move_record(testdb, oldrecp, oldblk, newblk, &newrecp, &dberr);
+    T_ASSERT_EQ(0, res);
+    T_ASSERT(newrecp != NULL);
+    T_ASSERT(BLK_CONTAINS_REC(newblk, newrecp));
+    T_ASSERT(REC_IS_TOMBSTONED(oldrecp));
+    T_ASSERT(! BLK_CONTAINS_REC(oldblk, newrecp));
+    T_ASSERT_EQ(oldblk_num_recs-1, (int)oldblk->bh_num_records);
+    T_ASSERT_EQ(1, (int)newblk->bh_num_records);
+
+    ASSERT(db_close(testdb) == 0);
     return 0;
 }
 
 int test_delete(void) {
-    T_ASSERT_EQ(0, db_open(testdb));
+    ASSERT(db_open(testdb) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "id=1"; // exists
 
@@ -115,13 +193,13 @@ int test_delete(void) {
     T_ASSERT_EQ(0, res);
     T_ASSERT(REC_IS_TOMBSTONED(rec));
 
-    T_ASSERT_EQ(0, db_close(testdb));
+    ASSERT(db_close(testdb) == 0);
     return 0;
 }
 
 int test_add_lots_of_small_recs(void) {
     int num_recs = 10000;
-    T_ASSERT_EQ(0, db_open(testdb));
+    ASSERT(db_open(testdb) == 0);
     const char *tblname = "students";
     const char *rowvals = "1,Mel";
     dberr_t dberr;
@@ -152,7 +230,7 @@ int test_add_lots_of_small_recs(void) {
     res = db_delete_records(testdb, &recinfos, &dberr);
     T_ASSERT_EQ(0, res);
 
-    T_ASSERT_EQ(0, db_close(testdb));
+    ASSERT(db_close(testdb) == 0);
     return 0;
 }
 
@@ -201,6 +279,8 @@ int main(int _argc, char **_argv) {
     RUN_TEST(test_addtbl);
     RUN_TEST(test_addrec_flushblk);
     RUN_TEST(test_findrec);
+    RUN_TEST(test_update_single_value_same_size);
+    RUN_TEST(test_move_record);
     RUN_TEST(test_delete);
     SKIP_TEST(test_add_lots_of_small_recs);
     rm_test_db();

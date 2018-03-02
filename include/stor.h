@@ -195,7 +195,7 @@ typedef struct stordb {
 } db_t;
 
 #define REC_VALUES_PTR(recp) (((char*)(recp))+(recp->header.rech_sz))
-#define REC_VALUE_PTR(recp,n) (((char*)(recp))+(recp->header.rech_sz+recp->header.rec_offsets[n]))
+#define REC_VALUE_PTR(recp,n) (((char*)(recp))+(recp->header.rech_sz+recp->header.rec_offsets[(n)]))
 #define REC_SZ(recp) (recp->header.rech_sz+recp->header.rec_sz)
 #define REC_H_TOMBSTONE_VALUE (SIZE_MAX)
 #define REC_IS_TOMBSTONED(recp) (*(size_t*)recp == REC_H_TOMBSTONE_VALUE)
@@ -222,6 +222,11 @@ for ((idx) = 0;\
     (var = (struct stordb_rec*)(((char*)(blkh))+blkh->bh_record_offsets[idx]));\
     idx++)
 
+#define PTR(ptr) ((char*)(ptr))
+
+#define BLK_FITS_RECSZ(blkh,recsz) ((blkh)->bh_free >= (recsz+sizeof(uint16_t)))
+#define BLK_CONTAINS_REC(blkh,recp) ((PTR(recp))-PTR((blkh)) > 0 && (PTR(recp))-(PTR(blkh)) < STOR_BLKSIZ)
+
 void die(const char *fmt, ...);
 int db_create(db_t *db);
 int db_open(db_t *db);
@@ -230,14 +235,17 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
 blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk);
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr);
 int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrchcrit_t *vsearch_crit, dberr_t *dberr);
-tbl_t *db_find_table(db_t *db, const char *tblname);
 int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchopt_t *options, vec_recinfo_t *vrecinfo_out, dberr_t *dberr);
 int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupdate_info, dberr_t *dberr);
 int db_delete_records(db_t *db, vec_recinfo_t *vrecinfo, dberr_t *dberr);
 int db_find_record(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, recinfo_t *recinfo_out, dberr_t *dberr);
+int db_move_record(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, rec_t **rec_out, dberr_t *dberr);
 blkh_t *db_load_blk(db_t *db, uint16_t num);
+blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl);
 tbl_t *db_table(db_t *db, int i);
+tbl_t *db_find_table(db_t *db, const char *tblname);
 col_t *db_col(tbl_t *tbl, int i);
+col_t *db_find_col(tbl_t *tbl, const char *name, int *colidx);
 int db_flush_meta(db_t *db);
 int db_flush_dirty_blks(db_t *db);
 
