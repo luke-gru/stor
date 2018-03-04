@@ -73,6 +73,7 @@ int main(int argc, char *argv[]) {
     memset(&dbmeta, 0, sizeof(dbmeta));
     vec_init(&db.db_blkcache);
     vec_init(&db.db_blksdirty);
+    vec_init(&db.db_vblkinfo);
     vec_init(&dbmeta.mt_tbls);
     db.db_fname = dbname;
     db.db_meta = dbmeta;
@@ -101,7 +102,7 @@ int main(int argc, char *argv[]) {
             fprintf(stdout, "Tables:\n");
         }
         for (int i = 0; i < num_tbls; i++) {
-            tbl_t *tbl = db_table(&db, i);
+            tbl_t *tbl = db_table_from_idx(&db, i);
             fprintf(stdout, "  id: %u, name: '%s', cols: %u, #blocks: %u\n",
                     tbl->tbl_id, tbl->tbl_name, tbl->tbl_num_cols, tbl->tbl_num_blks);
             if (tbl->tbl_num_blks > 0) {
@@ -115,7 +116,7 @@ int main(int argc, char *argv[]) {
                 fprintf(stdout, "\n");
             }
             for (int j = 0; j < tbl->tbl_num_cols; j++) {
-                col_t *col = db_col(tbl, j);
+                col_t *col = db_col_from_idx(tbl, j);
                 ASSERT(col);
                 fprintf(stdout, "  %s (%s)\n", col->col_name, coltype_str(col->col_type));
             }
@@ -157,7 +158,7 @@ int main(int argc, char *argv[]) {
         dberr_t dberr;
         recinfo_t recinfo;
         memset(&recinfo, 0, sizeof(recinfo));
-        tbl_t *tbl = db_find_table(&db, tblname);
+        tbl_t *tbl = db_table_from_name(&db, tblname);
         if (!tbl) {
             die("Couldn't find table: %s\n", tblname);
         }
@@ -186,7 +187,7 @@ int main(int argc, char *argv[]) {
         }
         DEBUG(DBG_STATE, "Loaded DB\n");
         dberr_t dberr;
-        tbl_t *tbl = db_find_table(&db, tblname);
+        tbl_t *tbl = db_table_from_name(&db, tblname);
         if (!tbl) {
             die("Couldn't find table: %s\n", tblname);
         }
@@ -233,7 +234,7 @@ int main(int argc, char *argv[]) {
         }
         DEBUG(DBG_STATE, "Loaded DB\n");
         dberr_t dberr;
-        tbl_t *tbl = db_find_table(&db, tblname);
+        tbl_t *tbl = db_table_from_name(&db, tblname);
         if (!tbl) {
             die("Couldn't find table: %s\n", tblname);
         }

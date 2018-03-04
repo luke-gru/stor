@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -177,22 +178,11 @@ typedef struct stordb_blk_h {
     tblid_t bh_tbl_id;
     uint16_t bh_free;
     uint16_t bh_num_records;
+    // NOTE: offsets are from the start of the block header, NOT from the start of this array
     uint16_t bh_record_offsets[];
 } PACKED blkh_t;
 
-typedef vec_t(struct stordb_blk_h*) vec_blkp_t;
-
-typedef struct stordb {
-    const char *db_fname;
-    int db_fd;
-    off_t db_offset;
-    bool db_mt_dirty;
-    struct db_tagged_err db_lasterr;
-    vec_blkp_t db_blkcache;
-    vec_int_t db_blksdirty;
-    unsigned db_num_writes;
-    struct stordb_meta db_meta;
-} db_t;
+typedef vec_t(blkh_t*) vec_blkp_t;
 
 #define REC_VALUES_PTR(recp) (((char*)(recp))+(recp->header.rech_sz))
 #define REC_VALUE_PTR(recp,n) (((char*)(recp))+(recp->header.rech_sz+recp->header.rec_offsets[(n)]))
@@ -205,7 +195,7 @@ typedef struct stordb_rec_h {
     off_t rec_offsets[]; // values[] offsets for sorted columns
 } PACKED rech_t;
 typedef struct stordb_rec {
-    struct stordb_rec_h header;
+    rech_t header;
     unsigned char values[];
 } PACKED rec_t;
 typedef vec_t(rec_t*) vec_recp_t;
@@ -216,39 +206,88 @@ typedef struct stordb_recinfo {
 } recinfo_t;
 typedef vec_t(recinfo_t) vec_recinfo_t;
 
+typedef struct stordb_blkdata {
+    blkh_t *blk;
+    uint16_t blkoff;
+    uint16_t datasz;
+} blkdata_t;
+typedef vec_t(blkdata_t) vec_blkdata_t;
+
+typedef struct stordb_blkinfo {
+    blkh_t *blk;
+    vec_blkdata_t blk_holes;
+    bool holes_computed; // is the blk hole info up-to-date (it's lazily computed, on demand)
+    bool is_dirty;
+} blkinfo_t;
+typedef vec_t(blkinfo_t) vec_blkinfo_t;
+
+typedef struct stordb {
+    const char *db_fname;
+    int db_fd;
+    off_t db_offset;
+    bool db_mt_dirty;
+    struct db_tagged_err db_lasterr;
+    unsigned db_num_writes;
+    bool db_mem_only;
+    vec_blkp_t db_blkcache; // data blocks loaded into memory
+    vec_int_t db_blksdirty; // data blocks needing to be written back to disk
+    vec_blkinfo_t db_vblkinfo; // cached info on data blocks, such as computed holes, etc.
+    struct stordb_meta db_meta;
+} db_t;
+
 #define BLK_RECORDS_FOREACH(blkh, var, idx)\
 for ((idx) = 0;\
     ((idx) < (blkh)->bh_num_records) &&\
-    (var = (struct stordb_rec*)(((char*)(blkh))+blkh->bh_record_offsets[idx]));\
+    (var = (rec_t*)(((char*)(blkh))+blkh->bh_record_offsets[idx]));\
     idx++)
 
 #define PTR(ptr) ((char*)(ptr))
 
 #define BLK_FITS_RECSZ(blkh,recsz) ((blkh)->bh_free >= (recsz+sizeof(uint16_t)))
 #define BLK_CONTAINS_REC(blkh,recp) ((PTR(recp))-PTR((blkh)) > 0 && (PTR(recp))-(PTR(blkh)) < STOR_BLKSIZ)
+#define BLKH_SIZE(blkh) (sizeof(*blkh)+(blkh->bh_num_records*sizeof(uint16_t)))
+#define BLK_END(blkp) (PTR(blkp)+STOR_BLKSIZ)
+#define BLK_FREE_INITIAL (STOR_BLKSIZ-sizeof(blkh_t))
 
 void die(const char *fmt, ...);
 int db_create(db_t *db);
 int db_open(db_t *db);
 int db_close(db_t *db);
 int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *dberr);
-blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk);
+blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, uint16_t *blk_offset, bool *isnewblk);
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr);
 int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrchcrit_t *vsearch_crit, dberr_t *dberr);
 int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchopt_t *options, vec_recinfo_t *vrecinfo_out, dberr_t *dberr);
 int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupdate_info, dberr_t *dberr);
 int db_delete_records(db_t *db, vec_recinfo_t *vrecinfo, dberr_t *dberr);
 int db_find_record(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, recinfo_t *recinfo_out, dberr_t *dberr);
-int db_move_record(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, rec_t **rec_out, dberr_t *dberr);
+int db_move_record_to_blk(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, uint16_t newrec_blkoff, rec_t **rec_out, dberr_t *dberr);
 blkh_t *db_load_blk(db_t *db, uint16_t num);
 blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl);
-tbl_t *db_table(db_t *db, int i);
-tbl_t *db_find_table(db_t *db, const char *tblname);
-col_t *db_col(tbl_t *tbl, int i);
-col_t *db_find_col(tbl_t *tbl, const char *name, int *colidx);
+tbl_t *db_table_from_idx(db_t *db, int idx);
+tbl_t *db_table_from_id(db_t *db, tblid_t tblid);
+tbl_t *db_table_from_name(db_t *db, const char *tblname);
+col_t *db_col_from_idx(tbl_t *tbl, int idx);
+col_t *db_col_from_name(tbl_t *tbl, const char *name, int *colidx);
 int db_flush_meta(db_t *db);
 int db_flush_dirty_blks(db_t *db);
 
+rec_t *BLK_LAST_REC(blkh_t *blk);
+rec_t *BLK_FIRST_REC(blkh_t *blk);
+rec_t *BLK_NTH_REC(blkh_t *blk, int n);
+void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_recompute);
+void blk_mark_hole_filled(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t fill_start, uint16_t fill_end);
+void blk_mark_new_hole(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t hole_start, uint16_t hole_end);
+void db_grow_record_within_blk(blkh_t *blk, rec_t *rec, col_t *col, void *rec_newstart, dbsrchcrit_t *update_info, size_t diffsz);
+int  db_blk_cpy_rec(db_t *db, blkh_t *blk, rec_t *rec, uint16_t blk_off, rec_t **recout);
+blkinfo_t *db_blkinfo(db_t *db, blkh_t *blk);
+
+
+dbval_t REC_DBVAL(rec_t *rec, int colidx, coltype_t type);
+void *DBVAL_PTR(dbval_t *dbval, coltype_t type);
+size_t DBVAL_SZ(dbval_t *val, coltype_t type);
 const char *coltype_str(coltype_t coltype);
+
+void db_log_last_err(db_t *db);
 
 #endif

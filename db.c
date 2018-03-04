@@ -40,6 +40,11 @@ static int db_seek(db_t *db, int whence, off_t offset) {
 }
 
 static ssize_t db_write(db_t *db, void *buf, size_t bufsize) {
+    if (db->db_mem_only) {
+        db->db_offset += bufsize;
+        db->db_num_writes++;
+        return bufsize;
+    }
     ASSERT(db->db_fd > 0);
     ssize_t res = write(db->db_fd, buf, bufsize);
     if (res == -1) return res;
@@ -136,17 +141,17 @@ int db_open(db_t *db) {
     return 0;
 }
 
-tbl_t *db_table(db_t *db, int i) {
-    ASSERT(i >= 0 && i < db->db_meta.mt_tbls.length);
-    return db->db_meta.mt_tbls.data[i];
+tbl_t *db_table_from_idx(db_t *db, int idx) {
+    ASSERT(idx >= 0 && idx < db->db_meta.mt_tbls.length);
+    return db->db_meta.mt_tbls.data[idx];
 }
 
-col_t *db_col(tbl_t *tbl, int i) {
-    ASSERT(i < tbl->tbl_num_cols);
-    return &tbl->tbl_cols.data[i];
+col_t *db_col_from_idx(tbl_t *tbl, int idx) {
+    ASSERT(idx < tbl->tbl_num_cols);
+    return &tbl->tbl_cols.data[idx];
 }
 
-col_t *db_find_col(tbl_t *tbl, const char *name, int *colidx) {
+col_t *db_col_from_name(tbl_t *tbl, const char *name, int *colidx) {
     col_t *col;
     int i = 0;
     vec_foreach_ptr(&tbl->tbl_cols, col, i) {
@@ -161,6 +166,10 @@ col_t *db_find_col(tbl_t *tbl, const char *name, int *colidx) {
 }
 
 int db_flush_meta(db_t *db) {
+    if (db->db_mem_only) {
+        db->db_mt_dirty = false;
+        return 0;
+    }
     if (db->db_fd <= 0) {
         return -1;
     }
@@ -175,7 +184,7 @@ int db_flush_meta(db_t *db) {
     write_res = db_write(db, &db->db_meta, meta_bytes);
     if (write_res == -1) return write_res;
     for (int i = 0; i < db->db_meta.mt_num_tables; i++) {
-        tbl_t *tbl = db_table(db, i);
+        tbl_t *tbl = db_table_from_idx(db, i);
         ASSERT(tbl);
         size_t fulltbl_sz = DB_TBL_SER_BYTES_POSTLOAD(tbl);
         unsigned char *tblbuf = malloc(fulltbl_sz);
@@ -251,7 +260,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
     int num_tbls = db->db_meta.mt_num_tables;
     tblid_t new_id = 1;
     for (int i = 0; i < num_tbls; i++) {
-        tbl_t *tbl = db_table(db, i);
+        tbl_t *tbl = db_table_from_idx(db, i);
         ASSERT(tbl->tbl_id > 0);
         if (strcmp(tblname, tbl->tbl_name) == 0) {
             *dberr = DBERR_TBLNAME_EXISTS;
@@ -262,7 +271,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
             new_id = tbl->tbl_id+1;
         }
     }
-    struct stordb_tbl *newtbl = malloc(sizeof(*newtbl));
+    tbl_t *newtbl = malloc(sizeof(*newtbl));
     ASSERT(newtbl);
     memset(newtbl, 0, sizeof(*newtbl));
     newtbl->tbl_id = new_id;
@@ -305,7 +314,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
         }
 
         numcols++;
-        struct stordb_col *newcol = malloc(sizeof(*newcol));
+        col_t *newcol = malloc(sizeof(*newcol));
         ASSERT(newcol);
         memset(newcol, 0, sizeof(*newcol));
         newcol->col_id = (new_id * 1000) + numcols;
@@ -401,6 +410,7 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
             break;
         }
         default:
+            ASSERT(0);
             *dberr = DBERR_COLTYPE_INVALID;
             return -1;
     }
@@ -425,6 +435,12 @@ blkh_t *db_load_blk(db_t *db, uint16_t num) {
     int res = db_read(db, blk, STOR_BLKSIZ);
     if (res <= 0) return NULL;
     vec_push(&db->db_blkcache, (blkh_t*)blk);
+    blkinfo_t blkinfo;
+    vec_init(&blkinfo.blk_holes);
+    blkinfo.blk = (blkh_t*)blk;
+    blkinfo.is_dirty = false;
+    blkinfo.holes_computed = false;
+    vec_push(&db->db_vblkinfo, blkinfo);
     return (blkh_t*)blk;
 }
 
@@ -435,7 +451,7 @@ blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
     if (seek_res != 0) {
         return NULL;
     }
-    struct stordb_blk_h *blk = malloc(STOR_BLKSIZ);
+    blkh_t *blk = malloc(STOR_BLKSIZ);
     ASSERT(blk);
     memset(blk, 0, STOR_BLKSIZ);
     blk->bh_magic = STOR_BLKH_MAGIC;
@@ -447,6 +463,12 @@ blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
     if (res <= 0) return NULL;
     vec_push(&tbl->tbl_blks, num);
     vec_push(&db->db_blkcache, blk);
+    blkinfo_t blkinfo;
+    vec_init(&blkinfo.blk_holes);
+    blkinfo.blk = blk;
+    blkinfo.is_dirty = false;
+    blkinfo.holes_computed = true;
+    vec_push(&db->db_vblkinfo, blkinfo);
     tbl->tbl_num_blks++;
     db->db_mt_dirty = true;
     return blk;
@@ -495,10 +517,11 @@ static blkh_t *db_find_cached_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz) {
     return NULL;
 }
 
-// TODO: make smarter! Should have an index of blocks for tables somewhere
-blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, bool *isnewblk) {
+// FIXME: make smarter! Should have an index of blocks for tables somewhere
+blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, uint16_t *blk_off, bool *isnewblk) {
     ASSERT(recsz < STOR_BLKSIZ); // TODO: implement record fragments across blocks
     blkh_t *found = db_find_cached_blk_for_rec(db, tbl, recsz);
+    // FIXME: set *blk_off
     if (found) return found;
     blkh_t *blk = NULL;
     uint16_t num = 1;
@@ -507,7 +530,7 @@ blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_no
         if (blk == NULL || blk->bh_magic != STOR_BLKH_MAGIC) {
             break;
         }
-        if (blk->bh_tbl_id == tbl->tbl_id && BLK_FITS_RECSZ(blk, recsz)) {
+        if (blk->bh_tbl_id == tbl->tbl_id && BLK_FITS_RECSZ(blk, recsz)) { // FIXME: BLK_FITS_RECSZ needs to look for holes, not just free size
             found = blk;
             break;
         }
@@ -519,18 +542,23 @@ blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_no
     if (!found) { // alloc
         blk = db_alloc_blk(db, num, tbl);
         ASSERT(blk);
+        if (blk_off != NULL) {
+            *blk_off = STOR_BLKSIZ-recsz;
+        }
         if (isnewblk != NULL) {
             *isnewblk = true;
         }
         return blk;
     } else {
+        // FIXME: set *blk_off
         return found;
     }
 }
 
+// FIXME: bh_free doesn't necessarily mean block fits record, have to look at holes
 static bool db_blk_fits_rec(blkh_t *blkh, rec_t *rec) {
-    size_t recsz_total = rec->header.rech_sz+rec->header.rec_sz;
-    return BLK_FITS_RECSZ(blkh, recsz_total);
+    size_t recsz = REC_SZ(rec);
+    return BLK_FITS_RECSZ(blkh, recsz);
 }
 
 static void db_mark_blk_dirty(db_t *db, blkh_t *blk) {
@@ -543,29 +571,34 @@ static void db_mark_blk_dirty(db_t *db, blkh_t *blk) {
 
 // Add a record to the in-memory representation of a data block. Caller must
 // check that there's room before calling.
-static int db_blk_add_rec(db_t *db, blkh_t *blk, rec_t *rec, rec_t **recout) {
+int db_blk_cpy_rec(db_t *db, blkh_t *blk, rec_t *rec, uint16_t blk_off, rec_t **recout) {
+    ASSERT(!REC_IS_TOMBSTONED(rec));
+    ASSERT(!BLK_CONTAINS_REC(blk, rec));
     size_t recsz_total = REC_SZ(rec);
     ASSERT(db_blk_fits_rec(blk, rec));
     char *cpystart = NULL;
     off_t rec_offset;
-    if (blk->bh_num_records == 0) {
-        rec_offset = STOR_BLKSIZ - recsz_total;
-    } else {
-        rec_offset = blk->bh_record_offsets[blk->bh_num_records-1] - recsz_total;
-        ASSERT(rec_offset > 0 && rec_offset < STOR_BLKSIZ);
+
+    if (blk_off > 0) {
+        rec_offset = blk_off;
+    } else { // FIXME: should always pass blk_off
+        if (blk->bh_num_records == 0) {
+            rec_offset = STOR_BLKSIZ - recsz_total;
+        } else {
+            rec_offset = PTR(BLK_LAST_REC(blk)) - PTR(blk);
+            rec_offset -= recsz_total;
+        }
     }
+    ASSERT(rec_offset > sizeof(blkh_t) && rec_offset < STOR_BLKSIZ);
     DEBUG(DBG_ADD, "Copying record (%lu bytes) at offset: %ld\n", recsz_total, rec_offset);
     DEBUG(DBG_ADD, "Copying record, blkh ptr: %p\n", blk);
-    DEBUG(DBG_ADD, "Copying record, blkh ptr+offset: %p\n", ((char*)blk)+rec_offset);
-    /*DEBUG(DBG_ADD, "Record header offset 0: %ld\n", rec->header.rec_offsets[0]);*/
-    /*DEBUG(DBG_ADD, "Record header offset 1: %ld\n", rec->header.rec_offsets[1]);*/
-    /*DEBUG(DBG_ADD, "First rec value: %d\n", *(int*)REC_VALUES_PTR(rec));*/
-    /*DEBUG(DBG_ADD, "Second rec value: %s\n", (char*)REC_VALUE_PTR(rec,1));*/
-    cpystart = ((char*)blk)+rec_offset;
+    DEBUG(DBG_ADD, "Copying record, blkh ptr+offset: %p\n", PTR(blk)+rec_offset);
+    cpystart = PTR(blk)+rec_offset;
     memcpy(cpystart, rec, recsz_total);
+    blk_mark_hole_filled(db, blk, NULL, rec_offset, rec_offset+recsz_total);
     blk->bh_free -= (recsz_total + sizeof(uint16_t));
+    blk->bh_record_offsets[blk->bh_num_records] = rec_offset;
     blk->bh_num_records++;
-    blk->bh_record_offsets[blk->bh_num_records-1] = rec_offset;
     db_mark_blk_dirty(db, blk);
     if (recout != NULL) {
         *recout = (rec_t*)cpystart;
@@ -575,11 +608,17 @@ static int db_blk_add_rec(db_t *db, blkh_t *blk, rec_t *rec, rec_t **recout) {
 
 static int REC_BLK_IDX(rec_t *rec, blkh_t *blk) {
     for (int i = 0; i < blk->bh_num_records; i++) {
-        if (((char*)blk)+blk->bh_record_offsets[i] == (char*)rec) {
+        if (PTR(blk)+blk->bh_record_offsets[i] == PTR(rec)) {
             return i;
         }
     }
     return -1;
+}
+
+static uint16_t REC_BLK_OFFSET(rec_t *rec, blkh_t *blk) {
+    ptrdiff_t offset = PTR(rec)-PTR(blk);
+    ASSERT(offset > 0 && offset < STOR_BLKSIZ);
+    return (uint16_t)offset;
 }
 
 // Remove a record from the in-memory representation of a data block.
@@ -604,19 +643,34 @@ static int db_blk_rm_rec(db_t *db, blkh_t *blk, rec_t *rec) {
                 ((old_num_recs-(recidx+1))*sizeof(uint16_t))
                );
     }
+    uint16_t rec_offset = REC_BLK_OFFSET(rec, blk);
+    blk_mark_new_hole(db, blk, NULL, rec_offset, rec_offset+rec_sz);
     db_mark_blk_dirty(db, blk);
     return 0;
 }
 
+rec_t *BLK_NTH_REC(blkh_t *blk, int n) {
+    if (blk->bh_num_records <= n) {
+        return NULL;
+    } else {
+        return (rec_t*)(PTR(blk)+blk->bh_record_offsets[n]);
+    }
+}
+// returns latest record entered into block
+rec_t *BLK_LAST_REC(blkh_t *blk) {
+    return BLK_NTH_REC(blk, blk->bh_num_records-1);
+}
+// returns first record entered into block
+rec_t *BLK_FIRST_REC(blkh_t *blk) {
+    return BLK_NTH_REC(blk, 0);
+}
+
+// NOTE: after success, the record can be accessed by BLK_LAST_REC(blkh_out)
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr) {
-    ASSERT(db);
-    ASSERT(tblname);
-    ASSERT(rowvals);
     const char *valsep = ",";
     tbl_t *tbl = NULL;
-    tbl = db_find_table(db, tblname);
+    tbl = db_table_from_name(db, tblname);
     if (!tbl) {
-        DEBUG(DBG_ADD, "!tbl\n");
         *dberr = DBERR_TBLNAME_NOEXIST;
         db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
         return -1;
@@ -626,14 +680,12 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     // strtok() doesn't work with string literals (modifies string)
     char *rowvals_dup = kstrndup(rowvals, 100);
     char *in = rowvals_dup;
-    /*size_t val_sizes[tbl->tbl_num_cols];*/
-    /*dbtval_t vals[tbl->tbl_num_cols];*/
-    size_t val_sizes[2];
-    dbtval_t vals[2];
+    size_t val_sizes[tbl->tbl_num_cols];
+    dbtval_t vals[tbl->tbl_num_cols];
     size_t recsz_total = 0;
     int validx = 0;
     while ((tok = strtok(in, valsep)) != NULL) {
-        col_t *col = db_col(tbl, validx);
+        col_t *col = db_col_from_idx(tbl, validx);
         if (!col) {
             *dberr = DBERR_TOO_MANY_REC_VALUES;
             db_set_lasterr(db, dberr, kstrndup(tok, 100));
@@ -656,7 +708,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         validx++;
         in = NULL;
     }
-    size_t rech_sz = sizeof(struct stordb_rec_h) + sizeof(off_t)*tbl->tbl_num_cols;
+    size_t rech_sz = sizeof(rech_t)+sizeof(off_t)*tbl->tbl_num_cols;
     rech_t *rech = malloc(rech_sz);
     ASSERT(rech);
     memset(rech, 0, rech_sz);
@@ -665,7 +717,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     off_t *rec_offsets = rech->rec_offsets;
     off_t rec_off = 0;
     for (int i = 0; i < tbl->tbl_num_cols; i++) {
-        DEBUG(DBG_ADD, "Saving record offset: %ld for colidx %d\n", rec_off, i);
+        DEBUG(DBG_ADD, "Saving record value offset: %ld for colidx %d\n", rec_off, i);
         rec_offsets[i] = rec_off;
         rec_off += val_sizes[i];
     }
@@ -676,6 +728,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     memcpy(rec, rech, rech_sz);
     ASSERT(rec->header.rech_sz == rech->rech_sz);
     ASSERT(rec->header.rec_sz == rech->rec_sz);
+    free(rech);
     char *rec_vals = REC_VALUES_PTR(rec);
     for (int i = 0; i < tbl->tbl_num_cols; i++) {
         ASSERT(val_sizes[i] > 0);
@@ -696,14 +749,13 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         rec_vals += val_sizes[i];
     }
     bool isnewblk = false;
-    DEBUG(DBG_ADD, "finding blk for rec\n");
-    blkh_t *blkh = db_find_blk_for_rec(db, tbl, recsz_all, true, &isnewblk);
+    blkh_t *blkh = db_find_blk_for_rec(db, tbl, recsz_all, true, NULL, &isnewblk);
     ASSERT(blkh);
+    int add_res = db_blk_cpy_rec(db, blkh, rec, 0, NULL);
+    if (add_res != 0) return add_res;
     if (blkh_out != NULL) {
         *blkh_out = blkh;
     }
-    int add_res = db_blk_add_rec(db, blkh, rec, NULL);
-    if (add_res != 0) return add_res;
     if (flushblk) {
         DEBUG(DBG_ADD, "flushing blk for new record\n");
         db_flush_blk(db, blkh);
@@ -735,7 +787,7 @@ static bool record_val_matches(dbtval_t *recval, dbsrchcrit_t *srchcrit) {
     }
 }
 
-static dbval_t REC_DBVAL(rec_t *rec, int colidx, coltype_t type) {
+dbval_t REC_DBVAL(rec_t *rec, int colidx, coltype_t type) {
     if (type == COLTYPE_VARCHAR) {
         return (dbval_t)REC_VALUE_PTR(rec, colidx);
     } else {
@@ -743,7 +795,7 @@ static dbval_t REC_DBVAL(rec_t *rec, int colidx, coltype_t type) {
     }
 }
 
-static void *DBVAL_PTR(dbval_t *dbval, coltype_t type) {
+void *DBVAL_PTR(dbval_t *dbval, coltype_t type) {
     switch(type) {
         case COLTYPE_VARCHAR:
             return dbval->sval;
@@ -807,15 +859,15 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
     const char *valcolsep = ",";
     char *tok = NULL;
     // strtok() doesn't work with string literals (modifies string)
-    char *srchcrit_strdup = kstrndup(srchcrit_str, 100);
+    char *srchcrit_strdup = kstrndup(srchcrit_str, 1024);
     char *in = srchcrit_strdup;
     int idx = 0;
-    int colidx;
+    int colidx = -1;
     col_t *col = NULL;
     while ((tok = strtok(in, idx % 2 == 0 ? colvalsep : valcolsep)) != NULL) {
         // parse column name
         if (idx % 2 == 0) {
-            col = db_find_col(tbl, tok, &colidx);
+            col = db_col_from_name(tbl, tok, &colidx);
             if (!col) {
                 *dberr = DBERR_COLNAME_NOEXIST;
                 db_set_lasterr(db, dberr, kstrndup(tok, STOR_COLNAME_MAX));
@@ -853,11 +905,22 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
     return 0;
 }
 
-tbl_t *db_find_table(db_t *db, const char *tblname) {
+tbl_t *db_table_from_name(db_t *db, const char *tblname) {
     tbl_t *curtbl = NULL;
     int i = 0;
     vec_foreach(&db->db_meta.mt_tbls, curtbl, i) {
         if (strncmp(curtbl->tbl_name, tblname, STOR_TBLNAME_MAX) == 0) {
+            return curtbl;
+        }
+    }
+    return NULL;
+}
+
+tbl_t *db_table_from_id(db_t *db, tblid_t tblid) {
+    tbl_t *curtbl = NULL;
+    int i = 0;
+    vec_foreach(&db->db_meta.mt_tbls, curtbl, i) {
+        if (curtbl->tbl_id == tblid) {
             return curtbl;
         }
     }
@@ -880,10 +943,7 @@ int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchop
         int recidx = 0;
         int num_found = 0;
         BLK_RECORDS_FOREACH(blk, rec, recidx) {
-            /*ASSERT(!REC_IS_TOMBSTONED(rec));*/
-            if (REC_IS_TOMBSTONED(rec)) {
-                continue;
-            }
+            ASSERT(!REC_IS_TOMBSTONED(rec));
             DEBUG(DBG_SRCH, "Record %d\n", recidx);
             DEBUG(DBG_SRCH, "  Block record offset: %u\n", blk->bh_record_offsets[recidx]);
             DEBUG(DBG_SRCH, "  Record found, rech_sz=%lu\n", rec->header.rech_sz);
@@ -905,7 +965,7 @@ int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchop
     return 0;
 }
 
-static size_t dbval_sz(dbval_t *val, coltype_t type) {
+size_t DBVAL_SZ(dbval_t *val, coltype_t type) {
     switch(type) {
         case COLTYPE_INT:
             return sizeof(int);
@@ -915,7 +975,7 @@ static size_t dbval_sz(dbval_t *val, coltype_t type) {
             return 1;
         case COLTYPE_VARCHAR:
             ASSERT(val->sval);
-            return strnlen(val->sval, STOR_VARCHAR_MAX);
+            return strnlen(val->sval, STOR_VARCHAR_MAX-1)+1;
         default:
             LOG_ERR("invalid type for dbval: %d\n", type);
             return 0;
@@ -929,20 +989,28 @@ static size_t dbval_sz(dbval_t *val, coltype_t type) {
 
 // Move record from old block to new block, tombstoning the space in the old block. There must be room in
 // newblk for the record, so the caller must check for this.
-int db_move_record(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, rec_t **recout, dberr_t *dberr) {
+int db_move_record_to_blk(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, uint16_t newrec_blkoff, rec_t **recout, dberr_t *dberr) {
     ASSERT(oldblk->bh_tbl_id == newblk->bh_tbl_id);
     ASSERT(BLK_CONTAINS_REC(oldblk, rec));
     ASSERT(oldblk != newblk);
     ASSERT(db_blk_fits_rec(newblk, rec));
     rec_t *new_rec = NULL;
-    int res = db_blk_add_rec(db, newblk, rec, &new_rec);
+    size_t rec_sz = REC_SZ(rec);
+    int res = db_blk_cpy_rec(db, newblk, rec, newrec_blkoff, &new_rec);
     if (res != 0) {
-        // TODO: set dberr
+        // FIXME: set dberr
+        ASSERT(0);
         (void)dberr;
         return res;
     }
+    ASSERT(new_rec);
+    DEBUG(DBG_UPDATE, "old recsz: %lu, new_rec sz: %lu\n", rec_sz, REC_SZ(new_rec));
+    ASSERT(rec_sz == REC_SZ(new_rec));
     ASSERT(BLK_CONTAINS_REC(newblk, new_rec));
     res = db_blk_rm_rec(db, oldblk, rec);
+    ASSERT(REC_IS_TOMBSTONED(rec));
+    ASSERT(!REC_IS_TOMBSTONED(new_rec));
+    ASSERT(BLK_CONTAINS_REC(newblk, new_rec));
     if (res != 0) {
         return res;
     }
@@ -952,25 +1020,441 @@ int db_move_record(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, rec_t *
     return 0;
 }
 
+static int sort_by_blkdata_offset_fn(const void *val1, const void *val2) {
+    if (((blkdata_t*)val1)->blkoff < ((blkdata_t*)val2)->blkoff) {
+        return -1;
+    } else {
+        return 1;
+    }
+}
+
+static bool interval_overlaps_blkdata(blkh_t *blk, blkdata_t *blkdata, uint16_t data_start, uint16_t data_end) {
+    ASSERT(blkdata->blk == blk);
+    ASSERT(data_end > data_start);
+    if (data_start < blkdata->blkoff) {
+        return data_end > blkdata->blkoff;
+    } else if (data_start > blkdata->blkoff) {
+        return data_start < blkdata->blkoff+blkdata->datasz;
+    } else {
+        return true;
+    }
+}
+
+blkinfo_t *db_blkinfo(db_t *db, blkh_t *blk) {
+    blkinfo_t *blkinfo_p = NULL;
+    int i;
+    vec_foreach_ptr(&db->db_vblkinfo, blkinfo_p, i) {
+        ASSERT(blkinfo_p->blk);
+        if (blkinfo_p->blk->bh_blkno == blk->bh_blkno) {
+            return blkinfo_p;
+        }
+    }
+    return NULL;
+}
+
+// Mark a hole as filled.
+// Example:
+//   Current block holes [off_start,off_end]: (100,150), (200,100)
+//   Mark filled [off_start,off_end]: (110,140)
+//   This area overlaps a hole and doesn't start or end at its boundaries, so
+//   we need to create a new hole.
+//   After the update we should have: (100,109), (141,150), (200,100)
+void blk_mark_hole_filled(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t fill_start, uint16_t fill_end) {
+    ASSERT(blk);
+    ASSERT(fill_end > fill_start);
+    uint16_t fillsz = fill_end-fill_start;
+    blkinfo_t *blkinfo_p = db_blkinfo(db, blk);
+    int i;
+    if (vholes == NULL) {
+        if (!blkinfo_p->holes_computed) {
+            blk_find_holes(db, blk, &blkinfo_p->blk_holes, true);
+        }
+        vholes = &blkinfo_p->blk_holes;
+    }
+    blkdata_t *hole;
+    i = 0;
+    int holeidx_del = -1;
+    /*int holeidx_new = -1;*/
+    vec_blkdata_t vadded_holes;
+    vec_init(&vadded_holes);
+    vec_foreach_ptr(vholes, hole, i) {
+        if (interval_overlaps_blkdata(blk, hole, fill_start, fill_end)) {
+            if (hole->blkoff == fill_start && hole->datasz == fillsz) {
+                holeidx_del = i;
+                break;
+            //
+            } else if (hole->blkoff == fill_start) { // hole filled at top of hole
+                hole->blkoff = fill_end+1;
+                hole->datasz -= (fillsz+1);
+                ASSERT(hole->datasz > 0);
+            } else if (fill_end == hole->blkoff+hole->datasz) { // hole filled at bottom of hole
+                hole->datasz -= (fillsz+1);
+            } else { // hole filled somewhere within the hole
+                // split hole in middle
+                ASSERT(fill_start > 0);
+                uint16_t hole_end1 = fill_start-1;
+                ASSERT(hole_end1 > hole->blkoff);
+                uint16_t hole_datasz_old = hole->datasz;
+                hole->datasz = hole_end1-hole->blkoff;
+                blkdata_t newhole;
+                newhole.blk = blk;
+                newhole.blkoff = fill_end+1;
+                uint16_t hole_end2 = hole->blkoff+hole_datasz_old;
+                ASSERT(hole_end2 > newhole.blkoff);
+                /*holeidx_new = i+1;*/
+                newhole.datasz = hole_end2-newhole.blkoff;
+                vec_push(&vadded_holes, newhole);
+            }
+        }
+    }
+    if (holeidx_del != -1) {
+        vec_splice(vholes, holeidx_del, 1);
+    } else if (vadded_holes.length > 0) {
+        ASSERT(vadded_holes.length == 1);
+        /*ASSERT(holeidx_new >= 0);*/
+        vec_push(vholes, vadded_holes.data[0]);
+        vec_deinit(&vadded_holes);
+    }
+}
+void blk_mark_new_hole(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t hole_start, uint16_t hole_end) {
+    ASSERT(hole_end > hole_start);
+    ASSERT(hole_end <= STOR_BLKSIZ);
+    blkinfo_t *blkinfo_p;
+    blkinfo_t *blkinfo_pfound = NULL;
+    int i;
+    if (vholes == NULL) {
+        vec_foreach_ptr(&db->db_vblkinfo, blkinfo_p, i) {
+            if (blkinfo_p->blk == blk) {
+                blkinfo_pfound = blkinfo_p;
+                break;
+            }
+        }
+        ASSERT(blkinfo_pfound);
+        if (!blkinfo_pfound->holes_computed) {
+            return;
+        }
+        vholes = &blkinfo_pfound->blk_holes;
+    }
+    blkdata_t hole;
+    hole.blk = blk;
+    hole.blkoff = hole_start;
+    hole.datasz = hole_end-hole_start;
+    vec_push(vholes, hole);
+}
+
+// Find holes in the block. Heuristic:
+// 1) Iterate over the records, saving their offset and size in arrays
+// ex: [10,40],[100,150] (2 records found, one near the top of the block (40 bytes),
+// the next further down at offset 100 (150 bytes).
+// 2) Sort the arrays by their offset (first element in the arrays)
+// 3) Iterate over the sorted arrays to find the holes
+// Holes= (0,9),(41,99),(151,END)
+void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_recompute) {
+    uint16_t blkoff_beg = BLKH_SIZE(blk);
+    blkinfo_t *blkinfo_p;
+    blkinfo_t *blkinfo_pfound = NULL;
+    int i = 0;
+    vec_foreach_ptr(&db->db_vblkinfo, blkinfo_p, i) {
+        if (blkinfo_p->blk == blk) {
+            blkinfo_pfound = blkinfo_p;
+            break;
+        }
+    }
+    ASSERT(blkinfo_pfound);
+    // if cached, just return them
+    if (blkinfo_pfound->holes_computed && !force_recompute) {
+        blkdata_t *cached_hole;
+        i = 0;
+        vec_foreach_ptr(&blkinfo_pfound->blk_holes, cached_hole, i) {
+            vec_push(vholes, *cached_hole);
+        }
+        return;
+    }
+
+    vec_blkdata_t vdata; // data in block
+    vec_init(&vdata);
+    if (blk->bh_num_records == 0) { // 1 big hole
+        blkdata_t hole;
+        hole.blk = blk;
+        hole.blkoff = blkoff_beg+2;
+        hole.datasz = STOR_BLKSIZ-hole.blkoff;
+        vec_push(vholes, hole);
+        if (vholes != &blkinfo_pfound->blk_holes) {
+            vec_push(&blkinfo_pfound->blk_holes, hole);
+        }
+        blkinfo_pfound->holes_computed = true;
+        return;
+    }
+    vec_reserve(&vdata, blk->bh_num_records);
+    rec_t *rec;
+    i = 0;
+    BLK_RECORDS_FOREACH(blk, rec, i) {
+        blkdata_t recdata;
+        recdata.blk = blk;
+        recdata.blkoff = REC_BLK_OFFSET(rec, blk);
+        recdata.datasz = REC_SZ(rec);
+        DEBUG(DBG_TEST, "rec found: (blkoff: %u, datasz: %u)\n", recdata.blkoff, recdata.datasz);
+        vec_push(&vdata, recdata);
+    }
+    vec_sort(&vdata, sort_by_blkdata_offset_fn);
+    blkdata_t *recdata_p;
+    i = 0;
+    uint16_t last_offset = blkoff_beg;
+    vec_foreach_ptr(&vdata, recdata_p, i) {
+        if (recdata_p->blkoff > last_offset) { // found a hole
+            blkdata_t hole;
+            hole.blk = blk;
+            hole.blkoff = last_offset;
+            hole.datasz = recdata_p->blkoff - last_offset;
+            last_offset = recdata_p->blkoff+recdata_p->datasz;
+            DEBUG(DBG_TEST, "hole found: (blkoff: %u, datasz: %u)\n", hole.blkoff, hole.datasz);
+            vec_push(vholes, hole);
+            if (vholes != &blkinfo_pfound->blk_holes) {
+                vec_push(&blkinfo_pfound->blk_holes, hole);
+            }
+            blkinfo_pfound->holes_computed = true;
+        } else {
+            last_offset = recdata_p->blkoff+recdata_p->datasz;
+        }
+    }
+    if (last_offset < STOR_BLKSIZ) {
+        blkdata_t hole;
+        hole.blk = blk;
+        hole.blkoff = last_offset;
+        hole.datasz = STOR_BLKSIZ-last_offset;
+        DEBUG(DBG_TEST, "hole found: (blkoff: %u, datasz: %u)\n", hole.blkoff, hole.datasz);
+        vec_push(vholes, hole);
+        if (vholes != &blkinfo_pfound->blk_holes) {
+            vec_push(&blkinfo_pfound->blk_holes, hole);
+        }
+
+    }
+}
+
+// Heuristic:
+// There's sufficient space directly below our record if there's a hole that begins right below the record
+// and is big enough to contain the new space. NOTE: the passed in vholes are sorted by their block offsets.
+static bool blk_has_space_directly_below_record(blkh_t *blk, rec_t *rec, size_t new_space, vec_blkdata_t *vholes) {
+    size_t rec_off = REC_BLK_OFFSET(rec, blk);
+    ASSERT(rec_off < STOR_BLKSIZ && rec_off > 0);
+    uint16_t rec_btm_off = (uint16_t)rec_off+(uint16_t)REC_SZ(rec);
+    blkdata_t *holep;
+    int i;
+    DEBUG(DBG_UPDATE, "Trying to find hole directly below record (size needed: %lu) "\
+            "(record offset: %u, bottom offset: %u)\n",
+            new_space, (uint16_t)rec_off, rec_btm_off);
+    vec_foreach_ptr(vholes, holep, i) {
+        DEBUG(DBG_UPDATE, "  hole blkoff: %u, size: %u\n", holep->blkoff, holep->datasz);
+        if (holep->blkoff == rec_btm_off && holep->datasz >= new_space) {
+            DEBUG(DBG_UPDATE, "  FOUND hole (below rec)\n");
+            return true;
+        }
+    }
+    return false;
+}
+
+// Heuristic:
+// There's sufficient space directly above our record if there's a hole that begins above the record, ends 1 byte above the start
+// of the record, and is big enough to contain the new space. NOTE: the passed in vholes are sorted by their block offsets.
+static bool blk_has_space_directly_above_record(blkh_t *blk, rec_t *rec, size_t new_space, vec_blkdata_t *vholes) {
+    size_t rec_off = PTR(rec)-PTR(blk);
+    ASSERT(rec_off < STOR_BLKSIZ && rec_off > 0);
+    blkdata_t *holep;
+    int i;
+    DEBUG(DBG_UPDATE, "Trying to find hole above record (record offset: %lu)\n", rec_off);
+    vec_foreach_ptr(vholes, holep, i) {
+        DEBUG(DBG_UPDATE, "  hole blkoff: %u, size: %u\n", holep->blkoff, holep->datasz);
+        if (holep->blkoff < rec_off) {
+            uint16_t hole_end = holep->blkoff+holep->datasz;
+            if (hole_end == (uint16_t)rec_off && holep->datasz >= new_space) {
+                DEBUG(DBG_UPDATE, "  FOUND hole (above rec)\n");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Find a hole anywhere in the block for `rec_sz`.
+// TODO: take into account data fragmentation
+static blkdata_t *blk_find_hole_for_record(blkh_t *blk, size_t rec_sz, vec_blkdata_t *vholes) {
+    blkdata_t *hole;
+    int i;
+    vec_foreach_ptr(vholes, hole, i) {
+        if (hole->datasz >= rec_sz) {
+            return hole;
+        }
+    }
+    return NULL;
+}
+
+// Grow record within block, with update_info given for new value. Depending on value of
+// rec_newstart, record can:
+// 1) Grow down, if rec_newstart == rec (space must be available)
+// 1) Move up and grow down, if rec_newstart < rec (space must be available)
+// 1) Down up and grow down, if rec_newstart > rec (space must be available)
+void db_grow_record_within_blk(blkh_t *blk, rec_t *rec, col_t *col, void *rec_newstart, dbsrchcrit_t *update_info, size_t diffsz) {
+    size_t recsz = REC_SZ(rec);
+    ASSERT(diffsz > 0 && diffsz < (STOR_BLKSIZ - recsz));
+    char *rec_oldstart = PTR(rec);
+    char *valptr = REC_VALUE_PTR(rec, update_info->col_idx);
+    char *rec_oldval_start = valptr;
+    size_t rec_start_to_val_sz = rec_oldval_start-rec_oldstart;
+    char *rec_newval_start = rec_newstart+rec_start_to_val_sz;
+   // dbval_t curval = REC_DBVAL(rec, update_info->col_idx, update_info->type);
+    //size_t cursz = DBVAL_SZ(&curval, update_info->type);
+    size_t newsz = DBVAL_SZ(&update_info->val, update_info->type);
+    size_t cursz = newsz-diffsz;
+    ASSERT(newsz > cursz);
+    DEBUG(DBG_UPDATE, "newsz: %lu, cursz: %lu, diffsz: %lu\n", newsz, cursz, diffsz);
+    ASSERT((newsz - cursz) == diffsz);
+    char *rec_newval_end = rec_newval_start+newsz;
+    char *rec_oldval_end = valptr+cursz;
+    char *rec_old_end = rec_oldstart+recsz;
+    char *rec_new_end = rec_newstart+(recsz+diffsz);
+    uint16_t new_blk_offset = PTR(rec_newstart)-PTR(blk);
+    uint16_t old_blk_offset = PTR(rec_oldstart)-PTR(blk);
+    if (rec_newstart != rec_oldstart) {
+        DEBUG(DBG_UPDATE, "Updating record start, moved from old blkoff (%u) to (%u)\n",
+                old_blk_offset, new_blk_offset);
+        memcpy(rec_newstart, rec_oldstart, rec_start_to_val_sz);
+    } else {
+        ASSERT(rec_newval_start == rec_oldval_start);
+        ASSERT(rec_newval_end != rec_oldval_end);
+        ASSERT(rec_new_end != rec_old_end);
+    }
+    DEBUG(DBG_UPDATE, "Updating record column: %s (%s) (idx:%d), cursz: %lu, newsz: %lu\n",
+            col->col_name, coltype_str(col->col_type), update_info->col_idx, cursz, newsz);
+    memcpy(rec_newval_start, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+    if (rec_newval_start+newsz != rec_newval_end) {
+        memcpy(rec_newval_end, rec_oldval_end, rec_old_end-rec_oldval_end);
+    }
+    rec_t *newrec = (rec_t*)rec_newstart;
+    DEBUG(DBG_UPDATE, "newrec header old rec_sz: %lu\n", newrec->header.rec_sz);
+    newrec->header.rec_sz += diffsz;
+    DEBUG(DBG_UPDATE, "newrec header rec_sz: %lu\n", newrec->header.rec_sz);
+    if (rec_newstart != rec_oldstart) {
+        int record_idx = REC_BLK_IDX(rec, blk);
+        blk->bh_record_offsets[record_idx] = new_blk_offset;
+    }
+    blk->bh_free -= diffsz;
+}
+
+void db_log_last_err(db_t *db) {
+    if (db->db_lasterr.err) {
+        LOG_ERR("DB Error: %s\n", dbstrerr(db->db_lasterr.err));
+        if (db->db_lasterr.msg) {
+            LOG_ERR("DB Error msg: %s\n", db->db_lasterr.msg);
+        }
+    }
+}
+
 int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupdate_info, dberr_t *dberr) {
     recinfo_t *recinfo_p;
     int i = 0;
     rec_t *rec;
     blkh_t *blk;
+    tbl_t *tbl;
     vec_foreach_ptr(vrecinfo, recinfo_p, i) {
-        /*size_t size_diff = 0;*/
         rec = recinfo_p->rec;
         blk = recinfo_p->blk;
+        vec_blkdata_t vholes;
+        vec_init(&vholes);
+        tbl = db_table_from_id(db, blk->bh_tbl_id);
         dbsrchcrit_t *update_info;
         int j = 0;
         vec_foreach_ptr(vupdate_info, update_info, j) {
             dbval_t curval = REC_DBVAL(rec, update_info->col_idx, update_info->type);
-            size_t cursz = dbval_sz(&curval, update_info->type);
-            size_t newsz = dbval_sz(&update_info->val, update_info->type);
-            // TODO: handle VARCHAR record re-sizing and moving to new block, tombstoning old record
-            ASSERT(cursz == newsz);
-            char *ptr = REC_VALUE_PTR(rec, update_info->col_idx);
-            memcpy(ptr, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+            size_t cursz = DBVAL_SZ(&curval, update_info->type);
+            size_t newsz = DBVAL_SZ(&update_info->val, update_info->type);
+            DEBUG(DBG_UPDATE, "cursz: %lu, newsz: %lu\n", cursz, newsz);
+            char *valptr = REC_VALUE_PTR(rec, update_info->col_idx);
+            if (newsz < cursz) { // new size less, so it fits
+                size_t diffsz = cursz-newsz;
+                memcpy(valptr, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+                memset(valptr+newsz, 0, diffsz);
+                // TODO: mark a hole if this is the end of the record, or if
+                // it's not, move the rest of the record up if it's worth it
+                // (diffsz is a big value).
+            } else if (newsz > cursz) {
+                size_t diffsz = newsz-cursz;
+                // We need to find room for the new record value. There are a
+                // few scenarios to think of here.
+                // 1. We move the start of the record up the block and memcpy the
+                // old values up. We can only do this if there's room directly above
+                // our record.
+                //
+                // new:          ------
+                //               header
+                // old: ------   ==hh==
+                //      header   vlcol1
+                //      ==hh==   ==xx==
+                //      vlcol1   ==yy==
+                //      ==aa==   ==zz==
+                //      vlcol2   vlcol2
+                //      ==bb==   ==bb==
+                //      ==bb==   ==bb==
+                //      vlcol3   vlcol3
+                //      ------   ------
+                // 2. We grow the record down, by either
+                //   a) Extending the last dbval if it's the last in the record or
+                //   b) moving the start of the record down if the growing value isn't
+                //      the last dbval
+                //
+                // 3. We move the record to the start of an arbitrary (big enough) hole in
+                // our block and perform step 2 on it.
+                if (blk->bh_free >= diffsz) { // FIXME: don't just check bh_free here, check that there a HOLE big enough
+                    blk_find_holes(db, blk, &vholes, true);
+                    if (blk_has_space_directly_below_record(blk, rec, diffsz, &vholes)) {
+                        col_t *col = db_col_from_idx(tbl, update_info->col_idx);
+                        char *rec_newstart = PTR(rec);
+                        db_grow_record_within_blk(blk, rec, col, rec_newstart, update_info, diffsz);
+                    } else if (blk_has_space_directly_above_record(blk, rec, diffsz, &vholes)) {
+                        col_t *col = db_col_from_idx(tbl, update_info->col_idx);
+                        DEBUG(DBG_UPDATE, "Difference in record size after update: %lu\n", diffsz);
+                        char *rec_newstart = PTR(rec)-diffsz;
+                        db_grow_record_within_blk(blk, rec, col, rec_newstart, update_info, diffsz);
+                        recinfo_p->rec = (rec_t*)rec_newstart;
+                    } else { // try to find a hole elsewhere in the block
+                        col_t *col = db_col_from_idx(tbl, update_info->col_idx);
+                        size_t newrecsz = REC_SZ(rec)+newsz;
+                        blkdata_t *hole_found = NULL;
+                        hole_found = blk_find_hole_for_record(blk, newrecsz, &vholes);
+                        ASSERT(hole_found); // FIXME
+                        char *rec_newstart = PTR(blk)+hole_found->blkoff;
+                        db_grow_record_within_blk(blk, rec, col, rec_newstart, update_info, diffsz);
+                        recinfo_p->rec = (rec_t*)rec_newstart;
+                    }
+                } else { // have to find new block for this record (or lengthen the block/use block fragments)
+                    rec_t *new_rec = NULL;
+                    size_t newrecsz = REC_SZ(rec)+diffsz;
+                    bool isnewblk = false;
+                    uint16_t newrec_blkoff = 0;
+                    uint16_t oldrec_blkoff = REC_BLK_OFFSET(rec, blk);
+                    blkh_t *newblk = db_find_blk_for_rec(db, tbl, newrecsz, true, &newrec_blkoff, &isnewblk);
+                    ASSERT(newblk && newblk != blk);
+                    ASSERT(newrec_blkoff > 0 && newrec_blkoff < STOR_BLKSIZ);
+                    ASSERT(newrec_blkoff > sizeof(blkh_t));
+                    DEBUG(DBG_UPDATE, "Moving record from blk (%d) at offset %u to blk " \
+                            "(%d) at offset %u: new record size: %lu\n",
+                            blk->bh_blkno, oldrec_blkoff, newblk->bh_blkno, newrec_blkoff, newrecsz);
+                    int res = db_move_record_to_blk(db, rec, blk, newblk, newrec_blkoff, &new_rec, dberr);
+                    ASSERT(res == 0);
+                    DEBUG(DBG_UPDATE, "moved record\n");
+                    ASSERT(new_rec);
+                    DEBUG(DBG_UPDATE, "new record rec_sz: %lu, rectotal_sz: %lu\n", new_rec->header.rec_sz, REC_SZ(new_rec));
+                    col_t *col = db_col_from_idx(tbl, update_info->col_idx);
+                    DEBUG(DBG_UPDATE, "grow and move record: diffsz: %lu\n", diffsz);
+                    char *rec_newstart = PTR(new_rec);
+                    db_grow_record_within_blk(newblk, new_rec, col, rec_newstart, update_info, diffsz);
+                    DEBUG(DBG_UPDATE, "/grow and move record\n");
+                    recinfo_p->rec = new_rec;
+                    recinfo_p->blk = newblk;
+                    ASSERT(res == 0);
+                }
+            } else { // same size
+                memcpy(valptr, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+            }
         }
         db_mark_blk_dirty(db, blk);
     }
@@ -996,6 +1480,8 @@ int db_delete_records(db_t *db, vec_recinfo_t *vrecinfo, dberr_t *dberr) {
         memset(rec, 0, rec_sz);
         size_t tombstone_val = REC_H_TOMBSTONE_VALUE;
         memcpy(rec, &tombstone_val, sizeof(size_t));
+        uint16_t rec_offset = REC_BLK_OFFSET(rec, blk);
+        blk_mark_new_hole(db, blk, NULL, rec_offset, rec_offset+rec_sz);
         // Update the record offsets in the block header.
         // Example: deleting recidx = 1, old_num_recs = 10
         //   memmove(PTR+1, PTR+2, (10-2)*sizeof(uint16_t))
