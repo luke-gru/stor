@@ -1,6 +1,7 @@
 #include <stor.h>
 
 uint32_t stor_dbgflags;
+static char empty_page[STOR_PAGESZ];
 
 void die(const char *fmt, ...) {
     va_list ap;
@@ -10,11 +11,16 @@ void die(const char *fmt, ...) {
     exit(1);
 }
 
-static void db_set_lasterr(db_t *db, dberr_t *err, char *msg) {
-    db->db_lasterr.err = *err;
+static void db_set_lasterr(db_t *db, dberr_t *dberr, char *msg) {
+    db->db_lasterr.err = *dberr;
     if (db->db_lasterr.msg) {
         free(db->db_lasterr.msg);
-        db->db_lasterr.msg = msg; // can be NULL
+    }
+    db->db_lasterr.msg = msg; // can be NULL
+    if (*dberr == DBERR_ERRNO) {
+        db->db_lasterr.err_errno = errno;
+    } else {
+        db->db_lasterr.err_errno = 0;
     }
 }
 
@@ -62,29 +68,84 @@ static ssize_t db_read(db_t *db, void *buf, size_t bufsize) {
     return res;
 }
 
-static int db_load_next_table(db_t *db) {
+static int io_crosses_page_boundary(db_t *db, size_t io_bytelen) {
+    int curpage = db->db_offset / STOR_PAGESZ;
+    int afterpage = (db->db_offset+io_bytelen) / STOR_PAGESZ;
+    if (curpage == afterpage) { // same page
+        return 0;
+    } else {
+        return (db->db_offset+io_bytelen) % STOR_PAGESZ; // return IO bytes remaining for next page
+    }
+}
+
+static int db_load_next_table(db_t *db, blkh_t *nextblk, blkh_t **blockloadedfrom) {
     tbl_t *tbl = malloc(sizeof(*tbl));
-    ASSERT(tbl);
+    ASSERT_MEM(tbl);
     memset(tbl, 0, sizeof(*tbl));
+    int bytes_rem = 0;
 
     size_t tbl_preload_sz = DB_TBL_SER_BYTES_PRELOAD(tbl);
-    int res = db_read(db, tbl, tbl_preload_sz);
+    int res;
+    // ex: db_offset: 8100, tbl_preload_sz: 100, page size: 4096, read is
+    // split across this block and next meta block.
+    if ((bytes_rem = io_crosses_page_boundary(db, tbl_preload_sz)) > 0) {
+        ASSERT(nextblk);
+        DEBUG(DBG_TEST, "Read(1) crosses page boundary (db offset: %ld, size: %lu)\n", db->db_offset, tbl_preload_sz);
+        if (tbl_preload_sz-bytes_rem > 0) {
+            DEBUG(DBG_TEST, "First read(1) (db offset: %ld, size: %lu)\n", db->db_offset, tbl_preload_sz-bytes_rem);
+            res = db_read(db, tbl, tbl_preload_sz-bytes_rem);
+        }
+        ASSERT(nextblk->bh_blkno*STOR_PAGESZ >= db->db_offset);
+        res = db_seek(db, SEEK_SET, (nextblk->bh_blkno*STOR_PAGESZ)+sizeof(blkh_t));
+        ASSERT(res == 0);
+        DEBUG(DBG_TEST, "Second read(1) (db offset: %ld, size: %d)\n", db->db_offset, bytes_rem);
+        *blockloadedfrom = nextblk;
+        res = db_read(db, PTR(tbl)+(tbl_preload_sz-bytes_rem), bytes_rem);
+    } else {
+        DEBUG(DBG_TEST, "Direct read(1) (db offset: %ld, size: %lu)\n", db->db_offset, tbl_preload_sz);
+        res = db_read(db, tbl, tbl_preload_sz);
+    }
     if (res == -1) {
+        DEBUG(DBG_TEST, "read(1) ERROR: %d\n", res);
         free(tbl);
         return res;
     }
     ASSERT(tbl->tbl_id > 0);
+    DEBUG(DBG_TEST, "tbl_id: %u, tbl_num_cols: %u\n", tbl->tbl_id, tbl->tbl_num_cols);
+    ASSERT(tbl->tbl_num_cols <= STOR_MAX_TBL_COLS);
+    if (tbl->tbl_num_cols == 0) {
+        DEBUG(DBG_TEST, "0 cols found for table name: %s\n", tbl->tbl_name);
+    }
     vec_init(&tbl->tbl_cols);
-    vec_init(&tbl->tbl_blks);
+    vec_init(&tbl->tbl_blknos);
     size_t tbl_postload_sz = DB_TBL_SER_BYTES_POSTLOAD(tbl);
     if (tbl_postload_sz > tbl_preload_sz) {
         tbl = realloc(tbl, tbl_postload_sz);
-        ASSERT(tbl);
+        ASSERT_MEM(tbl);
         size_t coldata_sz = sizeof(col_t)*tbl->tbl_num_cols;
         unsigned char *coldata = malloc(coldata_sz);
-        ASSERT(coldata);
-        res = db_read(db, coldata, coldata_sz);
+        ASSERT_MEM(coldata);
+
+        DEBUG(DBG_TEST, "Coldata sz: %lu\n", coldata_sz);
+        if ((bytes_rem = io_crosses_page_boundary(db, coldata_sz)) > 0) {
+            ASSERT(nextblk);
+            ASSERT(*blockloadedfrom != nextblk);
+            DEBUG(DBG_TEST, "Read(2) crosses page boundary (db offset: %ld, size: %lu)\n", db->db_offset, coldata_sz);
+            if (coldata_sz-bytes_rem > 0) {
+                DEBUG(DBG_TEST, "First read(2) crosses page boundary (db offset: %ld, size: %lu)\n", db->db_offset, coldata_sz-bytes_rem);
+                res = db_read(db, coldata, coldata_sz-bytes_rem);
+            }
+            res = db_seek(db, SEEK_SET, (nextblk->bh_blkno*STOR_PAGESZ)+sizeof(blkh_t));
+            ASSERT(res == 0);
+            *blockloadedfrom = nextblk;
+            DEBUG(DBG_TEST, "Second read(2) (db offset: %ld, size: %d)\n", db->db_offset, bytes_rem);
+            res = db_read(db, coldata+(coldata_sz-bytes_rem), bytes_rem);
+        } else {
+            DEBUG(DBG_TEST, "Direct read(2) (db offset: %ld, size: %lu)\n", db->db_offset, coldata_sz);
+            res = db_read(db, coldata, coldata_sz);
+        }
         if (res == -1) {
+            DEBUG(DBG_TEST, "read(2) ERROR: %d\n", res);
             free(tbl); free(coldata);
             return res;
         }
@@ -92,50 +153,99 @@ static int db_load_next_table(db_t *db) {
         tbl->tbl_cols.length = tbl->tbl_cols.capacity = tbl->tbl_num_cols;
         DEBUG(DBG_SCHEMA, "Loaded %d columns for tbl %s\n", tbl->tbl_num_cols, tbl->tbl_name);
         col_t *firstcol = (col_t*)coldata;
-        DEBUG(DBG_SCHEMA, "first col type: %d, col name: %s\n", firstcol->col_type, firstcol->col_name);
-        /*col_t *seccol = (col_t*)coldata+1;*/
-        /*DEBUG(DBG_SCHEMA, "second col type: %d, col name: %s\n", seccol->col_type, seccol->col_name);*/
+        DEBUG(DBG_SCHEMA, "first col type: %s, col name: %s\n", coltype_str(&firstcol->qcol_type), firstcol->col_name);
         if (tbl->tbl_num_blks > 0) {
             size_t blkdata_sz = sizeof(uint16_t)*tbl->tbl_num_blks;
             unsigned char *blkdata = malloc(blkdata_sz);
-            ASSERT(blkdata);
-            res = db_read(db, blkdata, blkdata_sz);
+            ASSERT_MEM(blkdata);
+            if ((bytes_rem = io_crosses_page_boundary(db, blkdata_sz)) > 0) {
+                ASSERT(nextblk);
+                ASSERT(*blockloadedfrom != nextblk);
+                DEBUG(DBG_TEST, "Read(3) crosses page boundary (db offset: %ld, size: %lu)\n", db->db_offset, blkdata_sz);
+                if (blkdata_sz-bytes_rem > 0) {
+                    DEBUG(DBG_TEST, "First read(3) crosses page boundary (db offset: %ld, size: %lu)\n", db->db_offset, blkdata_sz-bytes_rem);
+                    res = db_read(db, blkdata, blkdata_sz-bytes_rem);
+                }
+                res = db_seek(db, SEEK_SET, (nextblk->bh_blkno*STOR_PAGESZ)+sizeof(blkh_t));
+                ASSERT(res == 0);
+                *blockloadedfrom = nextblk;
+                DEBUG(DBG_TEST, "Second read(3) crosses page boundary (db offset: %ld, size: %d)\n", db->db_offset, bytes_rem);
+                res = db_read(db, blkdata+(blkdata_sz-bytes_rem), bytes_rem);
+            } else {
+                DEBUG(DBG_TEST, "Direct read(3) (db offset: %ld, size: %lu)\n", db->db_offset, blkdata_sz);
+                res = db_read(db, blkdata, blkdata_sz);
+            }
             if (res == -1) {
+                DEBUG(DBG_TEST, "read(3) ERROR: %d\n", res);
                 free(tbl); free(coldata); free(blkdata);
                 return res;
             }
-            tbl->tbl_blks.data = (uint16_t*)blkdata;
-            tbl->tbl_blks.length = tbl->tbl_blks.capacity = tbl->tbl_num_blks;
+            tbl->tbl_blknos.data = (uint16_t*)blkdata;
+            tbl->tbl_blknos.length = tbl->tbl_blknos.capacity = tbl->tbl_num_blks;
         }
     }
     vec_push(&db->db_meta.mt_tbls, tbl);
     return 0;
 }
 
-static int db_load_meta(db_t *db) {
+static int db_load_meta(db_t *db, dberr_t *dberr) {
     ASSERT(db->db_offset == 0);
+    DEBUG(DBG_TEST, "Reading %lu bytes from offset 0\n", DB_META_SER_BYTES(&db->db_meta));
     int res = db_read(db, &db->db_meta, DB_META_SER_BYTES(&db->db_meta));
-    if (res == -1) return res;
+    if (res == -1) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return res;
+    }
     if (db->db_meta.mt_magic != STOR_META_MAGIC) {
         die("Unable to load database (maybe corrupted?): invalid header\n");
     }
+    uint16_t nextblkno = 0;
+    blkh_t *nextblk = NULL;
+    if (db->db_meta.mt_nextblkno > 0) {
+        nextblkno = db->db_meta.mt_nextblkno;
+        nextblk = db_load_blk(db, nextblkno, true);
+        if (nextblk) {
+            DEBUG(DBG_TEST, "!!found first nextblk, blkno: %u!!\n", nextblkno);
+        }
+    }
     if (db->db_meta.mt_num_tables > 0) {
         for (int i = 0; i < db->db_meta.mt_num_tables; i++) {
-            res = db_load_next_table(db);
-            if (res == -1) return res;
+            blkh_t *blockloadedfrom = NULL;
+            DEBUG(DBG_TEST, "db_load_next_table iter %d, db_offset: %ld\n", i, db->db_offset);
+            res = db_load_next_table(db, nextblk, &blockloadedfrom);
+            if (res == -1) {
+                *dberr = DBERR_LOADING_METAINFO;
+                db_set_lasterr(db, dberr, NULL);
+                return res;
+            }
+            if (nextblk && blockloadedfrom == nextblk) {
+                uint16_t nextblkno = nextblk->bh_nextblkno;
+                if (nextblkno > 0) {
+                    nextblk = db_load_blk(db, nextblkno, true);
+                    DEBUG(DBG_TEST, "!!loaded nextblk, blkno: %u!!\n", nextblkno);
+                } else {
+                    DEBUG(DBG_TEST, "!!no nextblk found!!\n");
+                    nextblk = NULL;
+                }
+            }
         }
     }
     return 0;
 }
 
-int db_open(db_t *db) {
+int db_open(db_t *db, dberr_t *dberr) {
     ASSERT(db->db_fname);
-    ASSERT(db->db_fd == 0);
+    //ASSERT(db->db_fd == 0);
     int fd = open(db->db_fname, O_RDWR);
-    if (fd == -1) return -1;
+    if (fd == -1) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
     db->db_fd = fd;
     db_seek(db, SEEK_SET, 0);
-    int load_res = db_load_meta(db);
+    int load_res = db_load_meta(db, dberr);
     if (load_res != 0) return load_res;
     ASSERT(db->db_meta.mt_sersize > 0);
     return 0;
@@ -165,7 +275,25 @@ col_t *db_col_from_name(tbl_t *tbl, const char *name, int *colidx) {
     return NULL;
 }
 
-int db_flush_meta(db_t *db) {
+static int db_flush_blk_header(db_t *db, blkh_t *blkh, dberr_t *dberr) {
+    off_t saved_offset = db->db_offset;
+    int seek_res = db_seek(db, SEEK_SET, blkh->bh_blkno*STOR_PAGESZ);
+    if (seek_res != 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    int write_res = db_write(db, blkh, sizeof(*blkh));
+    if (write_res == -1) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    db_seek(db, SEEK_SET, saved_offset);
+    return 0;
+}
+
+int db_flush_meta(db_t *db, dberr_t *dberr) {
     if (db->db_mem_only) {
         db->db_mt_dirty = false;
         return 0;
@@ -178,39 +306,144 @@ int db_flush_meta(db_t *db) {
     }
     int seek_res, write_res;
     seek_res = db_seek(db, SEEK_SET, 0);
-    if (seek_res != 0) return seek_res;
+    if (seek_res != 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
     ASSERT(db->db_meta.mt_magic == STOR_META_MAGIC);
     size_t meta_bytes = DB_META_SER_BYTES(&db->db_meta);
+    size_t blk_bytes_written = 0;
+    size_t bytes_written_total = 0;
+    int extra_blks_idx = 0;
+    int num_extra_blks = db->db_meta.mt_blks.length;
+    int extra_blks_needed = 0;
+    size_t alltbls_bytes = 0;
+    for (int i = 0; i < db->db_meta.mt_num_tables; i++) {
+        tbl_t *tbl = db_table_from_idx(db, i);
+        ASSERT(tbl);
+        size_t fulltbl_bytes = DB_TBL_SER_BYTES_POSTLOAD(tbl);
+        alltbls_bytes += fulltbl_bytes;
+    }
+    size_t meta_bytes_all = meta_bytes + alltbls_bytes;
+    extra_blks_needed = meta_bytes_all / STOR_PAGESZ;
+    while (num_extra_blks < extra_blks_needed) {
+        uint16_t next_blkno = db_next_blkno(db, dberr);
+        ASSERT(next_blkno > 0);
+        blkh_t *newblk = db_alloc_blk(db, next_blkno, NULL, false, dberr);
+        DEBUG(DBG_TEST, "Allocating new block (%u) for metainfo\n", next_blkno);
+        ASSERT(newblk);
+        if (db->db_meta.mt_blks.length > 0) {
+            int k;
+            blkh_t *blkp = NULL;
+            vec_foreach(&db->db_meta.mt_blks, blkp, k) {
+                if (k != db->db_meta.mt_blks.length-1) {
+                    ASSERT(blkp->bh_nextblkno > 0);
+                }
+            }
+            blkh_t *lastblk = vec_last(&db->db_meta.mt_blks);
+            ASSERT(lastblk->bh_nextblkno == 0);
+            lastblk->bh_nextblkno = next_blkno;
+            ASSERT(db_flush_blk_header(db, lastblk, dberr) == 0);
+        } else {
+            ASSERT(db->db_meta.mt_nextblkno == 0);
+            db->db_meta.mt_nextblkno = next_blkno;
+        }
+        vec_push(&db->db_meta.mt_blks, newblk);
+        num_extra_blks++;
+    }
+    seek_res = db_seek(db, SEEK_SET, 0);
+    if (seek_res != 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
     write_res = db_write(db, &db->db_meta, meta_bytes);
-    if (write_res == -1) return write_res;
+    if (write_res == -1) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    blk_bytes_written += meta_bytes;
+    bytes_written_total += meta_bytes;
     for (int i = 0; i < db->db_meta.mt_num_tables; i++) {
         tbl_t *tbl = db_table_from_idx(db, i);
         ASSERT(tbl);
         size_t fulltbl_sz = DB_TBL_SER_BYTES_POSTLOAD(tbl);
         unsigned char *tblbuf = malloc(fulltbl_sz);
-        ASSERT(tblbuf);
-        memcpy(tblbuf, tbl, sizeof(*tbl));
+        ASSERT_MEM(tblbuf);
+        memcpy(tblbuf, tbl, sizeof(*tbl)); // PRELOAD size
         col_t *curcol;
-        int i = 0;
+        int j = 0;
         unsigned char *tblbufp = tblbuf+sizeof(*tbl);
-        vec_foreach_ptr(&tbl->tbl_cols, curcol, i) {
+        // copy column info for table
+        vec_foreach_ptr(&tbl->tbl_cols, curcol, j) {
             memcpy(tblbufp, curcol, sizeof(*curcol));
             tblbufp += sizeof(*curcol);
         }
-        i = 0;
+        j = 0;
         uint16_t curblk = 0;
-        vec_foreach(&tbl->tbl_blks, curblk, i) {
+        // copy blk numbers for table
+        vec_foreach(&tbl->tbl_blknos, curblk, j) {
+            ASSERT(curblk > 0);
             memcpy(tblbufp, &curblk, sizeof(curblk));
             tblbufp += sizeof(curblk);
         }
         ASSERT(tblbufp - tblbuf == fulltbl_sz);
-        write_res = db_write(db, tblbuf, fulltbl_sz);
-        free(tblbuf);
-        if (write_res == -1) {
-            return write_res;
+        // ex: 1000 written, 3500 fulltbl_sz, 4096 pagesize, we write:
+        //   1) 3096 bytes to this block
+        //   2) 404 bytes to next block
+        //
+        if (blk_bytes_written+fulltbl_sz > STOR_PAGESZ) {
+            size_t thisblk_write_sz = STOR_PAGESZ-blk_bytes_written;
+            size_t nextblk_write_sz = fulltbl_sz - thisblk_write_sz;
+            DEBUG(DBG_TEST,
+                "i == %d, writing table buffer (%lu bytes) to offset %ld\n", i, thisblk_write_sz, db->db_offset
+            );
+            write_res = db_write(db, tblbuf, thisblk_write_sz);
+            if (write_res == -1) {
+                *dberr = DBERR_ERRNO;
+                db_set_lasterr(db, dberr, NULL);
+                return write_res;
+            }
+            blk_bytes_written += write_res;
+            bytes_written_total += write_res;
+            ASSERT(blk_bytes_written % STOR_PAGESZ == 0);
+            blk_bytes_written = sizeof(blkh_t);
+            uint16_t blkno = db->db_meta.mt_blks.data[extra_blks_idx]->bh_blkno;
+            ASSERT(blkno > 0);
+            db_seek(db, SEEK_SET, (blkno*STOR_PAGESZ)+sizeof(blkh_t));
+            extra_blks_idx++;
+            DEBUG(DBG_TEST,
+                "i == %d, writing table buffer (%lu bytes) to offset %ld\n", i, nextblk_write_sz, db->db_offset
+            );
+            write_res = db_write(db, tblbuf+thisblk_write_sz, nextblk_write_sz);
+            if (write_res == -1) {
+                *dberr = DBERR_ERRNO;
+                db_set_lasterr(db, dberr, NULL);
+                return write_res;
+            }
+            blk_bytes_written += write_res;
+            bytes_written_total += write_res;
+            free(tblbuf);
+        } else {
+            DEBUG(DBG_TEST,
+                "i == %d, writing table buffer (%lu bytes) to offset %ld\n", i, fulltbl_sz, db->db_offset
+            );
+            write_res = db_write(db, tblbuf, fulltbl_sz);
+            free(tblbuf);
+            if (write_res == -1) {
+                *dberr = DBERR_ERRNO;
+                db_set_lasterr(db, dberr, NULL);
+                return write_res;
+            }
+            blk_bytes_written += write_res;
+            bytes_written_total += write_res;
         }
     }
-    db->db_meta.mt_sersize = (size_t)db->db_offset;
+    ASSERT(meta_bytes_all == bytes_written_total);
+    ASSERT(extra_blks_idx == (db->db_meta.mt_blks.length));
+    db->db_meta.mt_sersize = bytes_written_total;
     seek_res = db_seek(db, SEEK_SET, 4);
     if (seek_res != 0) return seek_res;
     write_res = write(db->db_fd, &db->db_meta.mt_sersize, sizeof(size_t));
@@ -222,22 +455,49 @@ int db_flush_meta(db_t *db) {
     return 0;
 }
 
-static coltype_t coltype(char *coltype) {
-    if (strncmp(coltype, "int", 10) == 0) {
-        return COLTYPE_INT;
-    } else if (strncmp(coltype, "char", 10) == 0) {
-        return COLTYPE_CHAR;
-    } else if (strncmp(coltype, "varchar", 10) == 0) {
-        return COLTYPE_VARCHAR;
-    } else if (strncmp(coltype, "double", 10) == 0) {
-        return COLTYPE_DOUBLE;
+int db_coltype(db_t *db, char *coltype, qcoltype_t *qtype, dberr_t *dberr) {
+    if (strncmp(coltype, "int", 4) == 0) {
+        qtype->type = COLTYPE_INT;
+        qtype->size = sizeof(int);
+    } else if (strncmp(coltype, "char", 5) == 0) {
+        qtype->type = COLTYPE_CHAR;
+        qtype->size = 1;
+    } else if (strncmp(coltype, "varchar", 7) == 0) {
+        char *sz_delimstart = strchr(coltype, '(');
+        char *sz_delimend = NULL;
+        long sz_long;
+        if (sz_delimstart) {
+            sz_long = strtol(sz_delimstart+1, &sz_delimend, 10);
+            if (sz_long < 0 || sz_long == LONG_MAX) {
+                *dberr = DBERR_VAL_OUT_OF_RANGE;
+                db_set_lasterr(db, dberr, kstrdup("column size out of range"));
+                return -1;
+            }
+            if (sz_delimend == NULL || *sz_delimend != ')') {
+                *dberr = DBERR_PARSE_ERR;
+                db_set_lasterr(db, dberr, kstrdup("error parsing column size"));
+                return -1;
+            }
+            qtype->type = COLTYPE_VARCHAR;
+            qtype->size = (size_t)sz_long;
+            DEBUG(DBG_SCHEMA, "Adding VARCHAR type of size %lu\n", qtype->size);
+        } else {
+            qtype->type = COLTYPE_VARCHAR;
+            qtype->size = STOR_VARCHAR_MAX;
+        }
+    } else if (strncmp(coltype, "double", 7) == 0) {
+        qtype->type = COLTYPE_DOUBLE;
+        qtype->size = sizeof(double);
     } else {
-        return COLTYPE_ERR;
+        *dberr = DBERR_COLTYPE_INVALID;
+        db_set_lasterr(db, dberr, kstrndup(coltype, STOR_COLNAME_MAX));
+        return -1;
     }
+    return 0;
 }
 
-const char *coltype_str(coltype_t coltype) {
-    switch(coltype) {
+const char *coltype_str(qcoltype_t *qtype) {
+    switch(qtype->type) {
     case COLTYPE_INT:
         return "int";
     case COLTYPE_CHAR:
@@ -251,8 +511,8 @@ const char *coltype_str(coltype_t coltype) {
     }
 }
 
-int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *dberr) {
-    if (strnlen(tblname, STOR_TBLNAME_MAX)+1 > STOR_TBLNAME_MAX) {
+int db_add_table(db_t *db, const char *tblname, const char *colinfo, bool flush_to_disk, dberr_t *dberr) {
+    if (strnlen(tblname, STOR_TBLNAME_MAX+1) > STOR_TBLNAME_MAX) {
         *dberr = DBERR_TBLNAME_TOO_LONG;
         db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
         return -1;
@@ -262,7 +522,7 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
     for (int i = 0; i < num_tbls; i++) {
         tbl_t *tbl = db_table_from_idx(db, i);
         ASSERT(tbl->tbl_id > 0);
-        if (strcmp(tblname, tbl->tbl_name) == 0) {
+        if (strncmp(tblname, tbl->tbl_name, STOR_TBLNAME_MAX) == 0) {
             *dberr = DBERR_TBLNAME_EXISTS;
             db_set_lasterr(db, dberr, kstrndup(tblname, STOR_TBLNAME_MAX));
             return -1;
@@ -272,14 +532,14 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
         }
     }
     tbl_t *newtbl = malloc(sizeof(*newtbl));
-    ASSERT(newtbl);
+    ASSERT_MEM(newtbl);
     memset(newtbl, 0, sizeof(*newtbl));
     newtbl->tbl_id = new_id;
     strncpy(newtbl->tbl_name, tblname, STOR_TBLNAME_MAX);
     newtbl->tbl_num_cols = 0;
     newtbl->tbl_num_blks = 0;
     vec_init(&newtbl->tbl_cols);
-    vec_init(&newtbl->tbl_blks);
+    vec_init(&newtbl->tbl_blknos);
 
     char *colinfoend = (char*)colinfo + strnlen(colinfo, 1024);
     char *colsep = NULL; // 'col1:type1[,]col2:type2'
@@ -314,31 +574,30 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
         }
 
         numcols++;
-        col_t *newcol = malloc(sizeof(*newcol));
-        ASSERT(newcol);
-        memset(newcol, 0, sizeof(*newcol));
-        newcol->col_id = (new_id * 1000) + numcols;
+        col_t newcol;
+        memset(&newcol, 0, sizeof(newcol));
+        newcol.col_id = (new_id * 1000) + numcols;
         memset(colnamebuf, 0, sizeof(colnamebuf));
         memset(coltypebuf, 0, sizeof(coltypebuf));
-        DEBUG(DBG_SCHEMA, "Adding column %d (%d)\n", (int)colnamelen, (int)coltypelen);
         strncpy(colnamebuf, colbeg, colnamelen);
         strncpy(coltypebuf, coltypebeg, coltypelen);
-        strncpy(newcol->col_name, colnamebuf, colnamelen);
-        coltype_t col_type = coltype(coltypebuf);
-        if (col_type == COLTYPE_ERR) {
+        strncpy(newcol.col_name, colnamebuf, colnamelen);
+        DEBUG(DBG_SCHEMA, "Adding column \"%s\" (type:%s)\n", colnamebuf, coltypebuf);
+        qcoltype_t qcol_type;
+        int coltype_res = db_coltype(db, coltypebuf, &qcol_type, dberr);
+        if (coltype_res != 0) {
             LOG_ERR("Invalid column type: %s\n", coltypebuf);
-            *dberr = DBERR_COLTYPE_INVALID;
-            db_set_lasterr(db, dberr, kstrndup(coltypebuf, coltypelen));
             err = true;
             break;
         }
-        DEBUG(DBG_SCHEMA, "Adding column '%s', type: '%s'\n", colnamebuf, coltypebuf);
-        newcol->col_type = col_type;
+        newcol.qcol_type = qcol_type;
         newtbl->tbl_num_cols++;
-        vec_push(&newtbl->tbl_cols, *newcol);
+        vec_push(&newtbl->tbl_cols, newcol);
     } while (colbegnext != NULL);
 
     if (err) {
+        vec_deinit(&newtbl->tbl_cols);
+        vec_deinit(&newtbl->tbl_blknos);
         free(newtbl);
         return -1;
     }
@@ -347,13 +606,134 @@ int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *db
 
     db->db_mt_dirty = true;
     db->db_meta.mt_num_tables++;
-    db_flush_meta(db);
+    if (flush_to_disk) {
+        return db_flush_meta(db, dberr);
+    } else {
+        return 0;
+    }
+}
+
+// NOTE: assumes the given block is a data block, not a block for meta info
+static void db_free_blk(db_t *db, uint16_t cur_blkno) {
+    int blkinfo_idx = -1;
+    int blkcache_idx = -1;
+    int blksdirty_idx = -1;
+    bool freed_blk = false;
+    blkh_t *curblk = NULL;
+    int i;
+    vec_foreach(&db->db_blkcache, curblk, i) {
+        if (curblk->bh_blkno == cur_blkno) {
+            blkcache_idx = i;
+            break;
+        }
+    }
+    blkinfo_t *curblkinfo = NULL;
+    i = 0;
+    vec_foreach_ptr(&db->db_vblkinfo, curblkinfo, i) {
+        if (curblkinfo->blk->bh_blkno == cur_blkno) {
+            blkinfo_idx = i;
+            break;
+        }
+    }
+    i = 0;
+    uint16_t curblkno = 0;
+    vec_foreach(&db->db_blksdirty, curblkno, i) {
+        if (curblkno == cur_blkno) {
+            blksdirty_idx = i;
+            break;
+        }
+    }
+
+    if (blksdirty_idx != -1) {
+        vec_splice(&db->db_blksdirty, blksdirty_idx, 1);
+    }
+    if (blkcache_idx != -1) {
+        blkh_t *blk_found = db->db_blkcache.data[blkcache_idx];
+        ASSERT(blk_found);
+        free(blk_found);
+        freed_blk = true;
+        vec_splice(&db->db_blkcache, blkcache_idx, 1);
+    }
+    if (blkinfo_idx != -1) {
+        if (!freed_blk) {
+            free(db->db_vblkinfo.data[blkinfo_idx].blk);
+            freed_blk = true;
+        }
+        vec_splice(&db->db_vblkinfo, blkinfo_idx, 1);
+    }
+}
+
+
+int db_clear_blk(db_t *db, uint16_t num, dberr_t *dberr) {
+    ASSERT(num > 0);
+    off_t saved_offset = db->db_offset;
+    int res = db_seek(db, SEEK_SET, num*STOR_PAGESZ);
+    if (res != 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    uint16_t tombstone = STOR_BLKH_TOMBSTONE;
+    res = db_write(db, &tombstone, sizeof(uint16_t));
+    if (res <= 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    res = db_write(db, empty_page, sizeof(empty_page)-sizeof(uint16_t));
+    if (res <= 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    db_seek(db, SEEK_SET, saved_offset);
     return 0;
 }
 
-static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t *tval, size_t *valsz, dberr_t *dberr) {
-    tval->type = dbtype;
-    switch (dbtype) {
+int db_drop_table(db_t *db, tbl_t *tbl, bool clear_blks, bool flush_to_disk, dberr_t *dberr) {
+    vec_deinit(&tbl->tbl_cols);
+    uint16_t cur_blkno = 0;
+    int i = 0;
+    int clear_res;
+    vec_foreach(&tbl->tbl_blknos, cur_blkno, i) {
+        if (clear_blks) {
+            clear_res = db_clear_blk(db, cur_blkno, dberr);
+            db_free_blk(db, cur_blkno);
+            if (clear_res != 0) {
+                db_log_lasterr(db);
+                break; // just stop clearing the blocks
+            }
+        } else {
+            db_free_blk(db, cur_blkno);
+        }
+    }
+    if (clear_blks) {
+        vec_deinit(&tbl->tbl_blknos);
+    }
+    ASSERT(db->db_meta.mt_num_tables > 0);
+    db->db_meta.mt_num_tables--;
+    db->db_mt_dirty = true;
+    tbl_t *curtbl = NULL;
+    int mt_tbls_idx = -1;
+    i = 0;
+    vec_foreach(&db->db_meta.mt_tbls, curtbl, i) {
+        if (curtbl->tbl_id == tbl->tbl_id) {
+            if (tbl != curtbl) free(curtbl);
+            mt_tbls_idx = i;
+        }
+    }
+    ASSERT(mt_tbls_idx >= 0);
+    vec_splice(&db->db_meta.mt_tbls, mt_tbls_idx, 1);
+    if (flush_to_disk) {
+        return db_flush_meta(db, dberr);
+    } else {
+        return 0;
+    }
+}
+
+static int db_deserialize_val(db_t *db, char *dbval, qcoltype_t *qtype, dbtval_t *tval, size_t *valsz, dberr_t *dberr) {
+    tval->qtype = *qtype;
+    switch (qtype->type) {
         case COLTYPE_INT: {
             long val = strtol(dbval, NULL, 10);
             if (val < INT_MIN || val > INT_MAX) {
@@ -384,10 +764,10 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
             break;
         }
         case COLTYPE_VARCHAR: {
-            size_t len = strnlen(dbval, STOR_VARCHAR_MAX+1);
-            if (len > STOR_VARCHAR_MAX) {
+            size_t len = strnlen(dbval, qtype->size+1);
+            if (len > qtype->size) {
                 *dberr = DBERR_VAL_OUT_OF_RANGE;
-                db_set_lasterr(db, dberr, kstrndup(dbval, STOR_VARCHAR_MAX));
+                db_set_lasterr(db, dberr, kstrndup(dbval, qtype->size));
                 return -1;
             }
             tval->val = (dbval_t)dbval;
@@ -417,7 +797,8 @@ static int db_deserialize_val(db_t *db, char *dbval, coltype_t dbtype, dbtval_t 
     return 0;
 }
 
-blkh_t *db_load_blk(db_t *db, uint16_t num) {
+// Load block from disk (but checks cache first).
+blkh_t *db_load_blk(db_t *db, uint16_t num, bool restore_dboffset) {
     int i = 0;
     blkh_t *cachedblk;
     vec_foreach(&db->db_blkcache, cachedblk, i) {
@@ -425,14 +806,15 @@ blkh_t *db_load_blk(db_t *db, uint16_t num) {
             return cachedblk;
         }
     }
-    off_t offset = num * STOR_BLKSIZ;
+    off_t offset = num * STOR_PAGESZ;
+    off_t saved_offset = db->db_offset;
     int seek_res = db_seek(db, SEEK_SET, offset);
     if (seek_res != 0) {
         return NULL;
     }
-    unsigned char *blk = malloc(STOR_BLKSIZ);
-    ASSERT(blk);
-    int res = db_read(db, blk, STOR_BLKSIZ);
+    unsigned char *blk = malloc(STOR_PAGESZ);
+    ASSERT_MEM(blk);
+    int res = db_read(db, blk, STOR_PAGESZ);
     if (res <= 0) return NULL;
     vec_push(&db->db_blkcache, (blkh_t*)blk);
     blkinfo_t blkinfo;
@@ -441,45 +823,124 @@ blkh_t *db_load_blk(db_t *db, uint16_t num) {
     blkinfo.is_dirty = false;
     blkinfo.holes_computed = false;
     vec_push(&db->db_vblkinfo, blkinfo);
+    if (restore_dboffset) {
+        db_seek(db, SEEK_SET, saved_offset);
+    }
     return (blkh_t*)blk;
 }
 
-// TODO: make sure block doesn't exist before writing over it!
-blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl) {
-    off_t offset = num * STOR_BLKSIZ;
+// Allocates new data block memory, puts it into cache, and writes it to disk.
+// NOTE: Changes offset of db->db_offset.
+blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl, bool allow_overwrite, dberr_t *dberr) {
+    off_t offset = num * STOR_PAGESZ;
     int seek_res = db_seek(db, SEEK_SET, offset);
     if (seek_res != 0) {
+        *dberr = DBERR_SEEK_ERR;
+        db_set_lasterr(db, dberr, NULL);
         return NULL;
     }
-    blkh_t *blk = malloc(STOR_BLKSIZ);
-    ASSERT(blk);
-    memset(blk, 0, STOR_BLKSIZ);
+    if (!allow_overwrite) {
+        blkh_t blkh;
+        memset(&blkh, 0, sizeof(blkh));
+        off_t last_offset = db->db_offset;
+        db_read(db, &blkh, sizeof(blkh));
+        if (blkh.bh_magic == STOR_BLKH_MAGIC && blkh.bh_blkno > 0) {
+            *dberr = DBERR_INVALID_BLOCK_OVERWRITE;
+            db_set_lasterr(db, dberr, NULL);
+            return NULL;
+        }
+        db_seek(db, SEEK_SET, last_offset);
+    }
+    blkh_t *blk = malloc(STOR_PAGESZ);
+    ASSERT_MEM(blk);
+    memset(blk, 0, STOR_PAGESZ);
     blk->bh_magic = STOR_BLKH_MAGIC;
-    blk->bh_tbl_id = tbl->tbl_id;
+    if (tbl) {
+        blk->bh_tbl_id = tbl->tbl_id;
+        vec_push(&tbl->tbl_blknos, num);
+        tbl->tbl_num_blks++;
+    }
     blk->bh_blkno = num;
+    blk->bh_nextblkno = 0;
     blk->bh_num_records = 0;
-    blk->bh_free = STOR_BLKSIZ - sizeof(*blk);
-    int res = db_write(db, blk, STOR_BLKSIZ);
-    if (res <= 0) return NULL;
-    vec_push(&tbl->tbl_blks, num);
+    blk->bh_free = STOR_PAGESZ - sizeof(*blk);
+    int res = db_write(db, blk, STOR_PAGESZ);
+    if (res <= 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return NULL;
+    }
     vec_push(&db->db_blkcache, blk);
     blkinfo_t blkinfo;
     vec_init(&blkinfo.blk_holes);
     blkinfo.blk = blk;
     blkinfo.is_dirty = false;
-    blkinfo.holes_computed = true;
+    blkinfo.holes_computed = true; // FIXME: push 1 large hole
     vec_push(&db->db_vblkinfo, blkinfo);
-    tbl->tbl_num_blks++;
     db->db_mt_dirty = true;
     return blk;
 }
 
+uint16_t db_next_blkno(db_t *db, dberr_t *dberr) {
+    uint16_t max_dirty_blk = 0;
+    int cur_blkno;
+    int i;
+    vec_foreach(&db->db_blksdirty, cur_blkno, i) {
+        if (cur_blkno > max_dirty_blk) {
+            max_dirty_blk = cur_blkno;
+        }
+    }
+    uint16_t next_blkno = 1;
+    off_t saved_pos = db->db_offset;
+    off_t seek_res = db_seek(db, SEEK_END, 0);
+    if (seek_res != 0) {
+        *dberr = DBERR_SEEK_ERR;
+        db_set_lasterr(db, dberr, kstrdup("SEEK_END error"));
+        return 0;
+    }
+    size_t filesize = (size_t)db->db_offset;
+    ASSERT(filesize < STOR_PAGESZ || ((filesize % STOR_PAGESZ) == 0));
+    if (filesize < STOR_PAGESZ) {
+        next_blkno = 1;
+    } else if (filesize <= (STOR_PAGESZ*2)) {
+        next_blkno = 2;
+    } else {
+        blkh_t blkh;
+        int res = db_seek(db, SEEK_SET, filesize-STOR_PAGESZ);
+        ASSERT(res != -1);
+        res = db_read(db, &blkh, sizeof(blkh));
+        ASSERT(res != -1);
+        if (blkh.bh_magic != STOR_BLKH_MAGIC) {
+            DEBUG(DBG_TEST, "blkh.bh_magic: %u, filesize: %lu\n", blkh.bh_magic, filesize);
+        }
+        ASSERT(blkh.bh_magic == STOR_BLKH_MAGIC);
+        ASSERT(blkh.bh_blkno > 0);
+        next_blkno = blkh.bh_blkno+1;
+    }
+    if ((max_dirty_blk+1) > next_blkno) {
+        next_blkno = max_dirty_blk+1;
+    }
+    bool blk_in_use = true;
+    int read_res;
+    while (blk_in_use) {
+        db_seek(db, SEEK_SET, next_blkno*STOR_PAGESZ);
+        blkh_t blkh;
+        memset(&blkh, 0, sizeof(blkh));
+        read_res = db_read(db, &blkh, sizeof(blkh));
+        ASSERT(read_res != -1);
+        blk_in_use = blkh.bh_magic == STOR_BLKH_MAGIC;
+        if (blk_in_use) next_blkno++;
+    }
+    db_seek(db, SEEK_SET, saved_pos);
+    return next_blkno;
+}
+
 static int db_flush_blk(db_t *db, blkh_t *blk) {
     ASSERT(blk->bh_blkno > 0);
-    int res = db_seek(db, SEEK_SET, blk->bh_blkno * STOR_BLKSIZ);
+    int res = db_seek(db, SEEK_SET, blk->bh_blkno * STOR_PAGESZ);
     if (res != 0) return res;
-    ssize_t write_res = db_write(db, blk, STOR_BLKSIZ);
-    if (write_res != STOR_BLKSIZ) {
+    ssize_t write_res = db_write(db, blk, STOR_PAGESZ);
+    if (write_res != STOR_PAGESZ) {
         return -1;
     }
     return 0;
@@ -519,14 +980,14 @@ static blkh_t *db_find_cached_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz) {
 
 // FIXME: make smarter! Should have an index of blocks for tables somewhere
 blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, uint16_t *blk_off, bool *isnewblk) {
-    ASSERT(recsz < STOR_BLKSIZ); // TODO: implement record fragments across blocks
+    ASSERT(recsz < STOR_PAGESZ); // TODO: implement record fragments across blocks
     blkh_t *found = db_find_cached_blk_for_rec(db, tbl, recsz);
     // FIXME: set *blk_off
     if (found) return found;
     blkh_t *blk = NULL;
     uint16_t num = 1;
     do {
-        blk = db_load_blk(db, num);
+        blk = db_load_blk(db, num, true);
         if (blk == NULL || blk->bh_magic != STOR_BLKH_MAGIC) {
             break;
         }
@@ -540,10 +1001,11 @@ blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_no
         return NULL;
     }
     if (!found) { // alloc
-        blk = db_alloc_blk(db, num, tbl);
-        ASSERT(blk);
+        dberr_t dberr;
+        blk = db_alloc_blk(db, num, tbl, false, &dberr);
+        ASSERT(blk); // FIXME: check dberr
         if (blk_off != NULL) {
-            *blk_off = STOR_BLKSIZ-recsz;
+            *blk_off = STOR_PAGESZ-recsz;
         }
         if (isnewblk != NULL) {
             *isnewblk = true;
@@ -583,13 +1045,13 @@ int db_blk_cpy_rec(db_t *db, blkh_t *blk, rec_t *rec, uint16_t blk_off, rec_t **
         rec_offset = blk_off;
     } else { // FIXME: should always pass blk_off
         if (blk->bh_num_records == 0) {
-            rec_offset = STOR_BLKSIZ - recsz_total;
+            rec_offset = STOR_PAGESZ - recsz_total;
         } else {
             rec_offset = PTR(BLK_LAST_REC(blk)) - PTR(blk);
             rec_offset -= recsz_total;
         }
     }
-    ASSERT(rec_offset > sizeof(blkh_t) && rec_offset < STOR_BLKSIZ);
+    ASSERT(rec_offset > sizeof(blkh_t) && rec_offset < STOR_PAGESZ);
     DEBUG(DBG_ADD, "Copying record (%lu bytes) at offset: %ld\n", recsz_total, rec_offset);
     DEBUG(DBG_ADD, "Copying record, blkh ptr: %p\n", blk);
     DEBUG(DBG_ADD, "Copying record, blkh ptr+offset: %p\n", PTR(blk)+rec_offset);
@@ -617,7 +1079,7 @@ static int REC_BLK_IDX(rec_t *rec, blkh_t *blk) {
 
 static uint16_t REC_BLK_OFFSET(rec_t *rec, blkh_t *blk) {
     ptrdiff_t offset = PTR(rec)-PTR(blk);
-    ASSERT(offset > 0 && offset < STOR_BLKSIZ);
+    ASSERT(offset > 0 && offset < STOR_PAGESZ);
     return (uint16_t)offset;
 }
 
@@ -678,7 +1140,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     ASSERT(tbl->tbl_num_cols > 0);
     char *tok = NULL;
     // strtok() doesn't work with string literals (modifies string)
-    char *rowvals_dup = kstrndup(rowvals, 100);
+    char *rowvals_dup = kstrndup(rowvals, STOR_PAGESZ*2);
     char *in = rowvals_dup;
     size_t val_sizes[tbl->tbl_num_cols];
     dbtval_t vals[tbl->tbl_num_cols];
@@ -695,7 +1157,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
         dbtval_t tval;
         dberr_t deser_err;
         size_t valsz = 0;
-        int res = db_deserialize_val(db, tok, col->col_type, &tval, &valsz, &deser_err);
+        int res = db_deserialize_val(db, tok, &col->qcol_type, &tval, &valsz, &deser_err);
         if (res == -1) {
             *dberr = deser_err;
             free(rowvals_dup);
@@ -710,7 +1172,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     }
     size_t rech_sz = sizeof(rech_t)+sizeof(off_t)*tbl->tbl_num_cols;
     rech_t *rech = malloc(rech_sz);
-    ASSERT(rech);
+    ASSERT_MEM(rech);
     memset(rech, 0, rech_sz);
     rech->rech_sz = rech_sz;
     rech->rec_sz = recsz_total;
@@ -723,7 +1185,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     }
     size_t recsz_all = rech_sz+rech->rec_sz;
     rec_t *rec = malloc(recsz_all);
-    ASSERT(rec);
+    ASSERT_MEM(rec);
     memset(rec, 0, recsz_all);
     memcpy(rec, rech, rech_sz);
     ASSERT(rec->header.rech_sz == rech->rech_sz);
@@ -732,7 +1194,7 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
     char *rec_vals = REC_VALUES_PTR(rec);
     for (int i = 0; i < tbl->tbl_num_cols; i++) {
         ASSERT(val_sizes[i] > 0);
-        switch (vals[i].type) {
+        switch (vals[i].qtype.type) {
             case COLTYPE_VARCHAR:
                 DEBUG(DBG_ADD, "Copying string %s (%ld bytes) to record\n", vals[i].val.sval, val_sizes[i]);
                 memcpy(rec_vals, vals[i].val.sval, val_sizes[i]);
@@ -767,8 +1229,8 @@ int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **b
 }
 
 static bool record_val_matches(dbtval_t *recval, dbsrchcrit_t *srchcrit) {
-    ASSERT(recval->type == srchcrit->type && recval->type > COLTYPE_ERR);
-    switch(recval->type) {
+    ASSERT(recval->qtype.type == srchcrit->qtype.type && recval->qtype.type > COLTYPE_ERR);
+    switch(recval->qtype.type) {
         case COLTYPE_INT:
             DEBUG(DBG_SRCH, "FIND [INT] => recval: %d, srchcrit: %d\n", recval->val.ival, srchcrit->val.ival);
             return recval->val.ival == srchcrit->val.ival;
@@ -777,7 +1239,7 @@ static bool record_val_matches(dbtval_t *recval, dbsrchcrit_t *srchcrit) {
             return recval->val.cval == srchcrit->val.cval;
         case COLTYPE_VARCHAR:
             DEBUG(DBG_SRCH, "FIND [VARCHAR] => recval: %s, srchcrit: %s\n", recval->val.sval, srchcrit->val.sval);
-            return strncmp(recval->val.sval, srchcrit->val.sval, STOR_VARCHAR_MAX) == 0;
+            return strncmp(recval->val.sval, srchcrit->val.sval, recval->qtype.size) == 0;
         case COLTYPE_DOUBLE:
             DEBUG(DBG_SRCH, "FIND [DOUBLE] => recval: %f, srchcrit: %f\n", recval->val.dval, srchcrit->val.dval);
             return recval->val.dval == srchcrit->val.dval;
@@ -821,12 +1283,12 @@ static bool db_record_matches(rec_t *rec, vec_dbsrchcrit_t *vsearch_crit) {
             ASSERT(offset == 0);
         }
         dbtval_t tval;
-        tval.type = search_crit->type;
+        tval.qtype = search_crit->qtype;
         dbval_t val;
         DEBUG(DBG_SRCH, "record value offset for col idx %d: %ld\n",
             search_crit->col_idx, offset
         );
-        val = REC_DBVAL(rec, search_crit->col_idx, tval.type);
+        val = REC_DBVAL(rec, search_crit->col_idx, tval.qtype.type);
         tval.val = val;
         /*if (tval.type == COLTYPE_INT) {*/
             /*DEBUG(DBG_SRCH, "record value for int: %d\n", tval.val.ival);*/
@@ -856,7 +1318,7 @@ static void db_sort_srchcrit(tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit) {
 
 int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrchcrit_t *vsearch_crit, dberr_t *dberr) {
     const char *colvalsep = "=";
-    const char *valcolsep = ",";
+    const char *valcolsep = ","; // FIXME: allow ',' in varchar values!
     char *tok = NULL;
     // strtok() doesn't work with string literals (modifies string)
     char *srchcrit_strdup = kstrndup(srchcrit_str, 1024);
@@ -877,7 +1339,7 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
         } else {
             dbtval_t tval;
             dberr_t deser_err;
-            int res = db_deserialize_val(db, tok, col->col_type, &tval, NULL, &deser_err);
+            int res = db_deserialize_val(db, tok, &col->qcol_type, &tval, NULL, &deser_err);
             if (res == -1) {
                 *dberr = deser_err;
                 return -1;
@@ -887,7 +1349,7 @@ int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrch
             srchcrit.col_id = col->col_id;
             srchcrit.col_idx = colidx;
             srchcrit.val = tval.val;
-            srchcrit.type = tval.type;
+            srchcrit.qtype = tval.qtype;
             vec_push(vsearch_crit, srchcrit);
         }
         idx++;
@@ -933,8 +1395,8 @@ int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchop
     uint16_t blkno;
     int blkidx = 0;
     blkh_t *blk;
-    vec_foreach(&tbl->tbl_blks, blkno, blkidx) {
-        blk = db_load_blk(db, blkno);
+    vec_foreach(&tbl->tbl_blknos, blkno, blkidx) {
+        blk = db_load_blk(db, blkno, true);
         ASSERT(blk);
         if (blk->bh_num_records == 0) {
             continue;
@@ -965,8 +1427,8 @@ int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchop
     return 0;
 }
 
-size_t DBVAL_SZ(dbval_t *val, coltype_t type) {
-    switch(type) {
+size_t DBVAL_SZ(dbval_t *val, qcoltype_t *qtype) {
+    switch(qtype->type) {
         case COLTYPE_INT:
             return sizeof(int);
         case COLTYPE_DOUBLE:
@@ -975,9 +1437,9 @@ size_t DBVAL_SZ(dbval_t *val, coltype_t type) {
             return 1;
         case COLTYPE_VARCHAR:
             ASSERT(val->sval);
-            return strnlen(val->sval, STOR_VARCHAR_MAX-1)+1;
+            return strnlen(val->sval, qtype->size-1)+1;
         default:
-            LOG_ERR("invalid type for dbval: %d\n", type);
+            LOG_ERR("invalid type for dbval: %s\n", coltype_str(qtype));
             return 0;
     }
 }
@@ -1118,7 +1580,7 @@ void blk_mark_hole_filled(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t
 }
 void blk_mark_new_hole(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t hole_start, uint16_t hole_end) {
     ASSERT(hole_end > hole_start);
-    ASSERT(hole_end <= STOR_BLKSIZ);
+    ASSERT(hole_end <= STOR_PAGESZ);
     blkinfo_t *blkinfo_p;
     blkinfo_t *blkinfo_pfound = NULL;
     int i;
@@ -1142,7 +1604,9 @@ void blk_mark_new_hole(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, uint16_t ho
     vec_push(vholes, hole);
 }
 
-// Find holes in the block. Heuristic:
+// Find holes in the block. Add them to *vholes argument and
+// cache it in db->db_vblkinfo[n]->blk_holes.
+// Heuristic:
 // 1) Iterate over the records, saving their offset and size in arrays
 // ex: [10,40],[100,150] (2 records found, one near the top of the block (40 bytes),
 // the next further down at offset 100 (150 bytes).
@@ -1155,7 +1619,7 @@ void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_rec
     blkinfo_t *blkinfo_pfound = NULL;
     int i = 0;
     vec_foreach_ptr(&db->db_vblkinfo, blkinfo_p, i) {
-        if (blkinfo_p->blk == blk) {
+        if (blkinfo_p->blk->bh_blkno == blk->bh_blkno) {
             blkinfo_pfound = blkinfo_p;
             break;
         }
@@ -1177,7 +1641,7 @@ void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_rec
         blkdata_t hole;
         hole.blk = blk;
         hole.blkoff = blkoff_beg+2;
-        hole.datasz = STOR_BLKSIZ-hole.blkoff;
+        hole.datasz = STOR_PAGESZ-hole.blkoff;
         vec_push(vholes, hole);
         if (vholes != &blkinfo_pfound->blk_holes) {
             vec_push(&blkinfo_pfound->blk_holes, hole);
@@ -1217,11 +1681,11 @@ void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_rec
             last_offset = recdata_p->blkoff+recdata_p->datasz;
         }
     }
-    if (last_offset < STOR_BLKSIZ) {
+    if (last_offset < STOR_PAGESZ) {
         blkdata_t hole;
         hole.blk = blk;
         hole.blkoff = last_offset;
-        hole.datasz = STOR_BLKSIZ-last_offset;
+        hole.datasz = STOR_PAGESZ-last_offset;
         DEBUG(DBG_TEST, "hole found: (blkoff: %u, datasz: %u)\n", hole.blkoff, hole.datasz);
         vec_push(vholes, hole);
         if (vholes != &blkinfo_pfound->blk_holes) {
@@ -1229,6 +1693,7 @@ void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_rec
         }
 
     }
+    vec_deinit(&vdata);
 }
 
 // Heuristic:
@@ -1236,7 +1701,7 @@ void blk_find_holes(db_t *db, blkh_t *blk, vec_blkdata_t *vholes, bool force_rec
 // and is big enough to contain the new space. NOTE: the passed in vholes are sorted by their block offsets.
 static bool blk_has_space_directly_below_record(blkh_t *blk, rec_t *rec, size_t new_space, vec_blkdata_t *vholes) {
     size_t rec_off = REC_BLK_OFFSET(rec, blk);
-    ASSERT(rec_off < STOR_BLKSIZ && rec_off > 0);
+    ASSERT(rec_off < STOR_PAGESZ && rec_off > 0);
     uint16_t rec_btm_off = (uint16_t)rec_off+(uint16_t)REC_SZ(rec);
     blkdata_t *holep;
     int i;
@@ -1258,7 +1723,7 @@ static bool blk_has_space_directly_below_record(blkh_t *blk, rec_t *rec, size_t 
 // of the record, and is big enough to contain the new space. NOTE: the passed in vholes are sorted by their block offsets.
 static bool blk_has_space_directly_above_record(blkh_t *blk, rec_t *rec, size_t new_space, vec_blkdata_t *vholes) {
     size_t rec_off = PTR(rec)-PTR(blk);
-    ASSERT(rec_off < STOR_BLKSIZ && rec_off > 0);
+    ASSERT(rec_off < STOR_PAGESZ && rec_off > 0);
     blkdata_t *holep;
     int i;
     DEBUG(DBG_UPDATE, "Trying to find hole above record (record offset: %lu)\n", rec_off);
@@ -1295,7 +1760,7 @@ static blkdata_t *blk_find_hole_for_record(blkh_t *blk, size_t rec_sz, vec_blkda
 // 1) Down up and grow down, if rec_newstart > rec (space must be available)
 void db_grow_record_within_blk(blkh_t *blk, rec_t *rec, col_t *col, void *rec_newstart, dbsrchcrit_t *update_info, size_t diffsz) {
     size_t recsz = REC_SZ(rec);
-    ASSERT(diffsz > 0 && diffsz < (STOR_BLKSIZ - recsz));
+    ASSERT(diffsz > 0 && diffsz < (STOR_PAGESZ - recsz));
     char *rec_oldstart = PTR(rec);
     char *valptr = REC_VALUE_PTR(rec, update_info->col_idx);
     char *rec_oldval_start = valptr;
@@ -1303,7 +1768,7 @@ void db_grow_record_within_blk(blkh_t *blk, rec_t *rec, col_t *col, void *rec_ne
     char *rec_newval_start = rec_newstart+rec_start_to_val_sz;
    // dbval_t curval = REC_DBVAL(rec, update_info->col_idx, update_info->type);
     //size_t cursz = DBVAL_SZ(&curval, update_info->type);
-    size_t newsz = DBVAL_SZ(&update_info->val, update_info->type);
+    size_t newsz = DBVAL_SZ(&update_info->val, &update_info->qtype);
     size_t cursz = newsz-diffsz;
     ASSERT(newsz > cursz);
     DEBUG(DBG_UPDATE, "newsz: %lu, cursz: %lu, diffsz: %lu\n", newsz, cursz, diffsz);
@@ -1324,8 +1789,8 @@ void db_grow_record_within_blk(blkh_t *blk, rec_t *rec, col_t *col, void *rec_ne
         ASSERT(rec_new_end != rec_old_end);
     }
     DEBUG(DBG_UPDATE, "Updating record column: %s (%s) (idx:%d), cursz: %lu, newsz: %lu\n",
-            col->col_name, coltype_str(col->col_type), update_info->col_idx, cursz, newsz);
-    memcpy(rec_newval_start, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+            col->col_name, coltype_str(&col->qcol_type), update_info->col_idx, cursz, newsz);
+    memcpy(rec_newval_start, DBVAL_PTR(&update_info->val, update_info->qtype.type), newsz);
     if (rec_newval_start+newsz != rec_newval_end) {
         memcpy(rec_newval_end, rec_oldval_end, rec_old_end-rec_oldval_end);
     }
@@ -1340,9 +1805,12 @@ void db_grow_record_within_blk(blkh_t *blk, rec_t *rec, col_t *col, void *rec_ne
     blk->bh_free -= diffsz;
 }
 
-void db_log_last_err(db_t *db) {
+void db_log_lasterr(db_t *db) {
     if (db->db_lasterr.err) {
         LOG_ERR("DB Error: %s\n", dbstrerr(db->db_lasterr.err));
+        if (db->db_lasterr.err_errno) {
+            LOG_ERR("DB Errno errno msg: %s\n", strerror(db->db_lasterr.err_errno));
+        }
         if (db->db_lasterr.msg) {
             LOG_ERR("DB Error msg: %s\n", db->db_lasterr.msg);
         }
@@ -1364,14 +1832,14 @@ int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupda
         dbsrchcrit_t *update_info;
         int j = 0;
         vec_foreach_ptr(vupdate_info, update_info, j) {
-            dbval_t curval = REC_DBVAL(rec, update_info->col_idx, update_info->type);
-            size_t cursz = DBVAL_SZ(&curval, update_info->type);
-            size_t newsz = DBVAL_SZ(&update_info->val, update_info->type);
-            DEBUG(DBG_UPDATE, "cursz: %lu, newsz: %lu\n", cursz, newsz);
+            dbval_t curval = REC_DBVAL(rec, update_info->col_idx, update_info->qtype.type);
+            size_t cursz = DBVAL_SZ(&curval, &update_info->qtype);
+            size_t newsz = DBVAL_SZ(&update_info->val, &update_info->qtype);
+            /*DEBUG(DBG_UPDATE, "cursz: %lu, newsz: %lu\n", cursz, newsz);*/
             char *valptr = REC_VALUE_PTR(rec, update_info->col_idx);
             if (newsz < cursz) { // new size less, so it fits
                 size_t diffsz = cursz-newsz;
-                memcpy(valptr, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+                memcpy(valptr, DBVAL_PTR(&update_info->val, update_info->qtype.type), newsz);
                 memset(valptr+newsz, 0, diffsz);
                 // TODO: mark a hole if this is the end of the record, or if
                 // it's not, move the rest of the record up if it's worth it
@@ -1433,27 +1901,24 @@ int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupda
                     uint16_t oldrec_blkoff = REC_BLK_OFFSET(rec, blk);
                     blkh_t *newblk = db_find_blk_for_rec(db, tbl, newrecsz, true, &newrec_blkoff, &isnewblk);
                     ASSERT(newblk && newblk != blk);
-                    ASSERT(newrec_blkoff > 0 && newrec_blkoff < STOR_BLKSIZ);
+                    ASSERT(newrec_blkoff > 0 && newrec_blkoff < STOR_PAGESZ);
                     ASSERT(newrec_blkoff > sizeof(blkh_t));
                     DEBUG(DBG_UPDATE, "Moving record from blk (%d) at offset %u to blk " \
                             "(%d) at offset %u: new record size: %lu\n",
                             blk->bh_blkno, oldrec_blkoff, newblk->bh_blkno, newrec_blkoff, newrecsz);
                     int res = db_move_record_to_blk(db, rec, blk, newblk, newrec_blkoff, &new_rec, dberr);
                     ASSERT(res == 0);
-                    DEBUG(DBG_UPDATE, "moved record\n");
                     ASSERT(new_rec);
-                    DEBUG(DBG_UPDATE, "new record rec_sz: %lu, rectotal_sz: %lu\n", new_rec->header.rec_sz, REC_SZ(new_rec));
+                    /*DEBUG(DBG_UPDATE, "new record rec_sz: %lu, rectotal_sz: %lu\n", new_rec->header.rec_sz, REC_SZ(new_rec));*/
                     col_t *col = db_col_from_idx(tbl, update_info->col_idx);
-                    DEBUG(DBG_UPDATE, "grow and move record: diffsz: %lu\n", diffsz);
                     char *rec_newstart = PTR(new_rec);
                     db_grow_record_within_blk(newblk, new_rec, col, rec_newstart, update_info, diffsz);
-                    DEBUG(DBG_UPDATE, "/grow and move record\n");
                     recinfo_p->rec = new_rec;
                     recinfo_p->blk = newblk;
                     ASSERT(res == 0);
                 }
             } else { // same size
-                memcpy(valptr, DBVAL_PTR(&update_info->val, update_info->type), newsz);
+                memcpy(valptr, DBVAL_PTR(&update_info->val, update_info->qtype.type), newsz);
             }
         }
         db_mark_blk_dirty(db, blk);
@@ -1513,17 +1978,24 @@ int db_find_record(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, recinfo
     return 0;
 }
 
-int db_close(db_t *db) {
+int db_close(db_t *db, dberr_t *dberr) {
     DEBUG(DBG_STATE, "Closing db\n");
     if (db->db_fd <= 0) {
+        *dberr = DBERR_DB_NOT_OPEN;
+        db_set_lasterr(db, dberr, NULL);
         return -1;
     }
     if (db->db_mt_dirty) {
         DEBUG(DBG_SCHEMA|DBG_STATE, "Flushing metainfo on close (dirty)\n");
-        db_flush_meta(db);
+        // this call sets dberr, but we still try to close DB even if we get an error here
+        db_flush_meta(db, dberr);
     }
     int close_res = close(db->db_fd);
-    if (close_res != 0) return close_res;
+    if (close_res != 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, NULL);
+        return close_res;
+    }
     db->db_fd = 0;
     db->db_num_writes = 0;
     db->db_offset = 0;
@@ -1534,15 +2006,41 @@ int db_close(db_t *db) {
     return 0;
 }
 
-int db_create(db_t *db) {
+int db_create(db_t *db, dberr_t *dberr) {
     if (!db->db_fname) {
-        return -1;
+        *dberr = DBERR_DBNAME_INVALID;
+        db_set_lasterr(db, dberr, kstrdup("No database name given"));
     }
     int fd = create_dbfile(db->db_fname);
     if (fd == -1) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, kstrdup("Couldn't create database file"));
         return -1; // errno set
     }
     db->db_fd = fd;
+    return 0;
+}
+
+int db_clear(db_t *db, dberr_t *dberr) {
+    DEBUG(DBG_STATE, "Clearing db\n");
+    if (db->db_fd <= 0) {
+        *dberr = DBERR_DB_NOT_OPEN;
+        db_set_lasterr(db, dberr, NULL);
+        return -1;
+    }
+    int trunc_res = ftruncate(db->db_fd, 0);
+    if (trunc_res != 0) {
+        *dberr = DBERR_ERRNO;
+        db_set_lasterr(db, dberr, kstrdup("Error truncating file (db_clear)"));
+        return -1;
+    }
+    db->db_offset = 0;
+    db->db_mt_dirty = false;
+    vec_clear(&db->db_blkcache);
+    vec_clear(&db->db_blksdirty);
+    vec_clear(&db->db_vblkinfo);
+    memset(&db->db_meta, 0, sizeof(db->db_meta));
+    db->db_meta.mt_magic = STOR_META_MAGIC;
     return 0;
 }
 

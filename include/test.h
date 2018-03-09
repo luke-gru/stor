@@ -1,5 +1,6 @@
 #ifndef _STOR_TEST_H_
 #define _STOR_TEST_H_
+#include <setjmp.h>
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -15,6 +16,9 @@ extern int assertions_failed;
 extern int tests_passed;
 extern int tests_skipped;
 extern int tests_failed;
+
+static jmp_buf jmploc;
+bool jmpset = false;
 
 static inline void START_TESTS(void) {
     assertions_passed = 0;
@@ -39,6 +43,9 @@ static inline void END_TESTS(void) {
 static inline void FAIL_ASSERT(const char *file, int line, const char *func) {
     LOG_ERR("Assertion failed at %s:%d in %s\n", file, line, func);
     assertions_failed++;
+    if (jmpset) {
+        longjmp(jmploc, 1);
+    }
 }
 
 static inline void PASS_ASSERT(void) {
@@ -49,12 +56,20 @@ static inline void PASS_ASSERT(void) {
 static inline void _RUN_TEST(int (*test_fn)(void), const char *fnname) {
     DEBUG(DBG_TEST, "-- Running %s --\n", fnname);
     int old_failed = assertions_failed;
-    int res = test_fn();
-    if (res == 0 && old_failed == assertions_failed) {
-        tests_passed++;
-    } else {
+    int jmpres = setjmp(jmploc);
+    jmpset = true;
+    int testres;
+    if (jmpres == 0) { // jump was set
+        testres = test_fn();
+        if (testres == 0 && old_failed == assertions_failed) {
+            tests_passed++;
+        } else {
+            tests_failed++;
+        }
+    } else if (jmpres > 0) { // assertion failure caused jump
         tests_failed++;
     }
+    jmpset = false;
 }
 
 #define SKIP_TEST(testfn) _SKIP_TEST(#testfn)

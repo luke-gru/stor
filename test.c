@@ -7,6 +7,9 @@ char **argv;
 
 const char *TEST_DB = "build/testdb.db";
 db_t *testdb;
+dberr_t *testerr;
+
+static qcoltype_t *QCOLTYPE_VARCHAR_DEFAULT;
 
 int assertions_passed;
 int assertions_failed;
@@ -14,30 +17,88 @@ int tests_passed;
 int tests_skipped;
 int tests_failed;
 
+// helper functions
+static blkh_t *alloc_empty_mem_blk(uint16_t blkno, tbl_t *tbl) {
+    blkh_t *blk = malloc(STOR_PAGESZ);
+    ASSERT_MEM(blk);
+    memset(blk, 0, STOR_PAGESZ);
+    blk->bh_magic = STOR_BLKH_MAGIC;
+    blk->bh_blkno = blkno;
+    blk->bh_tbl_id = tbl->tbl_id;
+    blk->bh_free = STOR_PAGESZ-sizeof(*blk);
+    blk->bh_num_records = 0;
+
+    blkinfo_t blkinfo;
+    blkinfo.blk = blk;
+    vec_init(&blkinfo.blk_holes);
+    blkinfo.holes_computed = false;
+    blkinfo.is_dirty = false;
+    vec_push(&testdb->db_vblkinfo, blkinfo);
+    return blk;
+}
+
+static rec_t *blk_enter_fake_rec(blkh_t *blk, tbl_t *tbl, uint16_t rec_offset, size_t recsize) {
+    // NOTE: recsize includes record header size and record size
+    ASSERT(recsize > sizeof(rech_t));
+    ASSERT(rec_offset >= sizeof(blkh_t) && rec_offset < STOR_PAGESZ);
+    ASSERT(rec_offset+recsize <= STOR_PAGESZ);
+    ASSERT(blk->bh_tbl_id = tbl->tbl_id);
+    memset(PTR(blk)+rec_offset, 0, recsize);
+    rec_t *rec = (rec_t*)(PTR(blk)+rec_offset);
+    rec->header.rech_sz = sizeof(rech_t);
+    rec->header.rec_sz = recsize-sizeof(rech_t);
+    blk->bh_num_records++;
+    blk->bh_record_offsets[blk->bh_num_records-1] = rec_offset;
+    blk->bh_free -= (recsize+sizeof(uint16_t));
+    blk_mark_hole_filled(testdb, blk, NULL, rec_offset, rec_offset+recsize);
+    return rec;
+}
+
+static rec_t *blk_alloc_fake_rec(tbl_t *tbl, size_t recsz) {
+    size_t rech_sz = sizeof(rech_t)+(sizeof(off_t)*tbl->tbl_num_cols);
+    size_t recsz_total = recsz+rech_sz;
+    ASSERT(recsz_total <= STOR_PAGESZ);
+    rec_t *newrec = malloc(recsz_total);
+    ASSERT_MEM(newrec);
+    memset(newrec, 0, recsz_total);
+    newrec->header.rech_sz = rech_sz;
+    newrec->header.rec_sz = recsz;
+    return newrec;
+}
+
+static void empty_mem_blk(blkh_t *blk) {
+    blk->bh_num_records = 0;
+    blk->bh_free = BLK_FREE_INITIAL;
+}
+
+// tests begin
 int test_open_close(void) {
-    T_ASSERT_EQ(0, db_open(testdb));
-    T_ASSERT_EQ(0, db_close(testdb));
+    T_ASSERT_EQ(0, db_open(testdb, testerr));
+    T_ASSERT_EQ(0, db_close(testdb, testerr));
+cleanup:
     return 0;
 }
 
 int test_addtbl(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *tblcols = "id:int,name:varchar";
     dberr_t dberr;
     int old_num_tbls = (int)testdb->db_meta.mt_num_tables;
     unsigned old_num_writes = testdb->db_num_writes;
-    int add_tbl_res = db_add_table(testdb, tblname, tblcols, &dberr);
+    int add_tbl_res = db_add_table(testdb, tblname, tblcols, true, &dberr);
     T_ASSERT_EQ(0, add_tbl_res);
     T_ASSERT_EQ(old_num_tbls+1, (int)testdb->db_meta.mt_num_tables);
     T_ASSERT(old_num_writes < testdb->db_num_writes);
     T_ASSERT(!testdb->db_mt_dirty);
-    ASSERT(db_close(testdb) == 0);
+
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_addrec_flushblk(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *rowvals = "1,Mel";
     dberr_t dberr;
@@ -46,12 +107,14 @@ int test_addrec_flushblk(void) {
     int add_rec_res = db_add_record(testdb, tblname, rowvals, NULL, flushblk, &dberr);
     T_ASSERT_EQ(0, add_rec_res);
     T_ASSERT(old_num_writes < testdb->db_num_writes);
-    ASSERT(db_close(testdb) == 0);
+
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_findrec(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "id=1"; // exists
     tbl_t *tbl = db_table_from_name(testdb, tblname);
@@ -82,12 +145,13 @@ int test_findrec(void) {
     T_ASSERT_EQ(NULL, recinfo.rec);
     T_ASSERT_EQ(NULL, recinfo.blk);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_update_single_value_same_size(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "name=Mel"; // exists
     const char *updatevals_str = "name=Moo";
@@ -122,12 +186,13 @@ int test_update_single_value_same_size(void) {
     T_ASSERT(rec);
     T_ASSERT(strcmp((char*)REC_VALUE_PTR(rec, colidx), "Moo") == 0);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_move_record(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "id=1"; // exists
     tbl_t *tbl = db_table_from_name(testdb, tblname);
@@ -148,7 +213,7 @@ int test_move_record(void) {
     rec_t *newrecp = NULL;
     blkh_t *oldblk = recinfos.data[0].blk;
     int oldblk_num_recs = (int)oldblk->bh_num_records;
-    blkh_t *newblk = db_alloc_blk(testdb, oldblk->bh_blkno+1, tbl);
+    blkh_t *newblk = db_alloc_blk(testdb, oldblk->bh_blkno+1, tbl, false, &dberr);
     T_ASSERT(newblk);
 
     res = db_move_record_to_blk(testdb, oldrecp, oldblk, newblk, 0, &newrecp, &dberr);
@@ -160,12 +225,13 @@ int test_move_record(void) {
     T_ASSERT_EQ(oldblk_num_recs-1, (int)oldblk->bh_num_records);
     T_ASSERT_EQ(1, (int)newblk->bh_num_records);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_update_single_value_diff_size_move_up(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "name=Moo"; // exists
     const char *updatevals_str = "name=somebiggervalue";
@@ -198,17 +264,18 @@ int test_update_single_value_diff_size_move_up(void) {
     T_ASSERT(rec);
     T_ASSERT(strcmp((char*)REC_VALUE_PTR(rec, colidx), "somebiggervalue") == 0);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_update_single_value_diff_size_grow_down(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "tweets";
     const char *tblcols_str = "id:int,retweets:int,tweet:varchar";
     const char *updatevals_str = "tweet=A much longer tweet...abcdefg";
     dberr_t dberr;
-    int res = db_add_table(testdb, tblname, tblcols_str, &dberr);
+    int res = db_add_table(testdb, tblname, tblcols_str, true, &dberr);
     ASSERT(res == 0);
     tbl_t *tbl = db_table_from_name(testdb, tblname);
     blkh_t *blk = NULL;
@@ -257,7 +324,8 @@ int test_update_single_value_diff_size_grow_down(void) {
     DEBUG(DBG_TEST, "New tweet value: %s\n", (char*)REC_VALUE_PTR(top_rec,2));
     T_ASSERT(strcmp((char*)REC_VALUE_PTR(top_rec,2), "A much longer tweet...abcdefg") == 0);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
@@ -265,11 +333,11 @@ int test_update_single_value_diff_size_grow_down(void) {
 // block, and then update the bottom-most value with a bigger value. This
 // forces us to find a hole not directly above or below the record.
 int test_update_single_value_diff_size_move_same_block(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "restos";
     const char *tblcols_str = "num_stars:int,name:varchar";
     dberr_t dberr;
-    int res = db_add_table(testdb, tblname, tblcols_str, &dberr);
+    int res = db_add_table(testdb, tblname, tblcols_str, true, &dberr);
     ASSERT(res == 0);
     tbl_t *tbl = db_table_from_name(testdb, tblname);
     const char *rowvals_str = "5,Fung Shing";
@@ -316,19 +384,20 @@ int test_update_single_value_diff_size_move_same_block(void) {
     T_ASSERT(strcmp((char*)REC_VALUE_PTR(updated_rec, 1),
         "The Greatest Restaurant in the World") == 0);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_update_single_value_diff_size_move_diff_block(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
 
     const char *tblname = "films";
     const char *tblcols_str = "name:varchar,year:int";
     const char *longfilmname = "Night of the Day of the Dawn of the Son of the Bride of the Return of the Revenge of the Terror of the Attack of the Evil Mutant Hellbound Flesh-Eating Subhumanoid Zombified Living Dead Part 3";
     const char *updatevals_str = "name=Night of the Day of the Dawn of the Son of the Bride of the Return of the Revenge of the Terror of the Attack of the Evil Mutant Hellbound Flesh-Eating Subhumanoid Zombified Living Dead Part 3";
     dberr_t dberr;
-    int res = db_add_table(testdb, tblname, tblcols_str, &dberr);
+    int res = db_add_table(testdb, tblname, tblcols_str, true, &dberr);
     ASSERT(res == 0);
     tbl_t *tbl = db_table_from_name(testdb, tblname);
     blkh_t *blk = NULL;
@@ -365,11 +434,11 @@ int test_update_single_value_diff_size_move_diff_block(void) {
     vec_dbsrchcrit_t vupdate_info;
     vec_init(&vupdate_info);
     res = db_parse_srchcrit(testdb, tbl, updatevals_str, &vupdate_info, &dberr);
-    db_log_last_err(testdb);
+    db_log_lasterr(testdb);
     T_ASSERT_EQ(0, res);
-    char *dbval = DBVAL_PTR(&vupdate_info.data[0].val, COLTYPE_VARCHAR);
+    char *dbval = DBVAL_PTR(&vupdate_info.data[0].val, QCOLTYPE_VARCHAR_DEFAULT->type);
     T_ASSERT_EQ(0, strcmp(longfilmname, dbval));
-    T_ASSERT_EQ(strlen(longfilmname)+1, DBVAL_SZ(&vupdate_info.data[0].val, COLTYPE_VARCHAR));
+    T_ASSERT_EQ(strlen(longfilmname)+1, DBVAL_SZ(&vupdate_info.data[0].val, QCOLTYPE_VARCHAR_DEFAULT));
 
     res = db_update_records(testdb, &vrecinfo, &vupdate_info, &dberr);
     T_ASSERT_EQ(0, res);
@@ -379,15 +448,15 @@ int test_update_single_value_diff_size_move_diff_block(void) {
     T_ASSERT(newrec != top_rec);
     T_ASSERT(newblk != blk);
     char *newdbval = (char*)REC_VALUE_PTR(newrec,0);
-    DEBUG(DBG_TEST, "Updated film name: (%lu chars, expected: %lu): %s\n", strlen(newdbval), strlen(longfilmname), newdbval);
     T_ASSERT(strcmp(newdbval, longfilmname) == 0);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_delete(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *srchcrit_str = "id=1"; // exists
 
@@ -415,13 +484,14 @@ int test_delete(void) {
     T_ASSERT_EQ(0, res);
     T_ASSERT(REC_IS_TOMBSTONED(rec));
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_add_lots_of_small_recs(void) {
     int num_recs = 10000;
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     const char *tblname = "students";
     const char *rowvals = "1,Mel";
     dberr_t dberr;
@@ -452,12 +522,13 @@ int test_add_lots_of_small_recs(void) {
     res = db_delete_records(testdb, &recinfos, &dberr);
     T_ASSERT_EQ(0, res);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_blk_mark_hole_filled(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
 
     vec_deinit(&testdb->db_vblkinfo);
     vec_clear(&testdb->db_vblkinfo);
@@ -507,65 +578,14 @@ int test_blk_mark_hole_filled(void) {
     T_ASSERT_EQ(10, vholes.data[0].blkoff);
     T_ASSERT_EQ(79, vholes.data[0].datasz);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
-static blkh_t *alloc_empty_mem_blk(uint16_t blkno, tbl_t *tbl) {
-    blkh_t *blk = malloc(STOR_BLKSIZ);
-    ASSERT(blk);
-    memset(blk, 0, STOR_BLKSIZ);
-    blk->bh_magic = STOR_BLKH_MAGIC;
-    blk->bh_blkno = blkno;
-    blk->bh_tbl_id = tbl->tbl_id;
-    blk->bh_free = STOR_BLKSIZ-sizeof(*blk);
-    blk->bh_num_records = 0;
-
-    blkinfo_t blkinfo;
-    blkinfo.blk = blk;
-    vec_init(&blkinfo.blk_holes);
-    blkinfo.holes_computed = false;
-    blkinfo.is_dirty = false;
-    vec_push(&testdb->db_vblkinfo, blkinfo);
-    return blk;
-}
-
-static rec_t *blk_enter_fake_rec(blkh_t *blk, tbl_t *tbl, uint16_t rec_offset, size_t recsize) {
-    // NOTE: recsize includes record header size and record size
-    ASSERT(recsize > sizeof(rech_t));
-    ASSERT(rec_offset >= sizeof(blkh_t) && rec_offset < STOR_BLKSIZ);
-    ASSERT(rec_offset+recsize <= STOR_BLKSIZ);
-    ASSERT(blk->bh_tbl_id = tbl->tbl_id);
-    memset(PTR(blk)+rec_offset, 0, recsize);
-    rec_t *rec = (rec_t*)(PTR(blk)+rec_offset);
-    rec->header.rech_sz = sizeof(rech_t);
-    rec->header.rec_sz = recsize-sizeof(rech_t);
-    blk->bh_num_records++;
-    blk->bh_record_offsets[blk->bh_num_records-1] = rec_offset;
-    blk->bh_free -= (recsize+sizeof(uint16_t));
-    blk_mark_hole_filled(testdb, blk, NULL, rec_offset, rec_offset+recsize);
-    return rec;
-}
-
-static rec_t *blk_alloc_fake_rec(tbl_t *tbl, size_t recsz) {
-    size_t rech_sz = sizeof(rech_t)+(sizeof(off_t)*tbl->tbl_num_cols);
-    size_t recsz_total = recsz+rech_sz;
-    ASSERT(recsz_total <= STOR_BLKSIZ);
-    rec_t *newrec = malloc(recsz_total);
-    ASSERT(newrec);
-    memset(newrec, 0, recsz_total);
-    newrec->header.rech_sz = rech_sz;
-    newrec->header.rec_sz = recsz;
-    return newrec;
-}
-
-void empty_mem_blk(blkh_t *blk) {
-    blk->bh_num_records = 0;
-    blk->bh_free = BLK_FREE_INITIAL;
-}
 
 int test_blk_find_holes(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
     vec_deinit(&testdb->db_vblkinfo);
     vec_clear(&testdb->db_vblkinfo);
 
@@ -580,7 +600,7 @@ int test_blk_find_holes(void) {
     blk_find_holes(testdb, blk, &vholes, force_recompute);
     T_ASSERT_EQ(1, vholes.length);
     T_ASSERT_EQ(sizeof(blkh_t)+sizeof(uint16_t), vholes.data[0].blkoff);
-    T_ASSERT_EQ(STOR_BLKSIZ-sizeof(blkh_t)-sizeof(uint16_t), vholes.data[0].datasz);
+    T_ASSERT_EQ(STOR_PAGESZ-sizeof(blkh_t)-sizeof(uint16_t), vholes.data[0].datasz);
 
     // should create a hole at (sizeof(blkh_t),+9),(sizeof(blkh_t)+110,4096-sizeof(blkh_t))
     rec_t *newrec = blk_enter_fake_rec(blk, tbl, sizeof(blkh_t)+12, 100);
@@ -596,14 +616,16 @@ int test_blk_find_holes(void) {
     T_ASSERT_EQ(sizeof(blkh_t)+2, vholes.data[0].blkoff);
     T_ASSERT_EQ(10, vholes.data[0].datasz);
     T_ASSERT_EQ(112+sizeof(blkh_t), vholes.data[1].blkoff);
-    T_ASSERT_EQ(STOR_BLKSIZ-sizeof(blkh_t)-112, vholes.data[1].datasz);
+    T_ASSERT_EQ(STOR_PAGESZ-sizeof(blkh_t)-112, vholes.data[1].datasz);
 
-    ASSERT(db_close(testdb) == 0);
+cleanup:
+    if (blk) free(blk);
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
 int test_db_blk_cpy_rec(void) {
-    ASSERT(db_open(testdb) == 0);
+    ASSERT(db_open(testdb, testerr) == 0);
 
     tbl_t *tbl = db_table_from_name(testdb, "students");
     ASSERT(tbl);
@@ -629,7 +651,120 @@ int test_db_blk_cpy_rec(void) {
     T_ASSERT_EQ(recsz, REC_SZ(recout));
     T_ASSERT_EQ(PTR(recout), PTR(blk)+blk_offset);
 
-    ASSERT(db_close(testdb) == 0);
+
+cleanup:
+    if (blk) free(blk);
+    if (bigrec) free(bigrec);
+    ASSERT(db_close(testdb, testerr) == 0);
+    return 0;
+}
+
+int test_varchar_value_bigger_than_255_chars(void) {
+    ASSERT(db_open(testdb, testerr) == 0);
+
+    const char *tblname = "computers";
+    const char *tblcols_str = "id:int,brand:varchar(1024)";
+    dberr_t dberr;
+    int res = db_add_table(testdb, tblname, tblcols_str, true, &dberr);
+    db_log_lasterr(testdb);
+    ASSERT(res == 0);
+    tbl_t *tbl = db_table_from_name(testdb, tblname);
+    ASSERT(tbl);
+
+    char *large_brand = malloc(1024);
+    ASSERT_MEM(large_brand);
+    memset(large_brand, 'a', 1023);
+    large_brand[1023] = '\0';
+
+    char *rowvals_str = malloc(1024+2);
+    ASSERT_MEM(rowvals_str);
+    memcpy(rowvals_str, (char*)"1,", 2);
+    memcpy(rowvals_str+2, large_brand, 1024);
+    blkh_t *blk = NULL;
+    int add_rec_res = db_add_record(testdb, tblname, rowvals_str, &blk, true, &dberr);
+    T_ASSERT_EQ(0, add_rec_res);
+    T_ASSERT(blk != NULL);
+    rec_t *rec = BLK_LAST_REC(blk);
+    T_ASSERT(BLK_CONTAINS_REC(blk, rec));
+    T_ASSERT(strcmp(large_brand, (char*)REC_VALUE_PTR(rec,1)) == 0);
+
+cleanup:
+    if (large_brand) free(large_brand);
+    if (rowvals_str) free(rowvals_str);
+    ASSERT(db_close(testdb, testerr) == 0);
+    return 0;
+}
+
+int test_db_next_blkno(void) {
+    ASSERT(db_open(testdb, testerr) == 0);
+    const char *tblname = "computers";
+    tbl_t *tbl = db_table_from_name(testdb, tblname);
+    ASSERT(tbl);
+    dberr_t dberr = 0;
+    off_t saved_offset = testdb->db_offset;
+    uint16_t next_blkno = db_next_blkno(testdb, &dberr);
+    DEBUG(DBG_TEST, "next blkno: %u\n", next_blkno);
+    T_ASSERT(next_blkno > 0);
+    T_ASSERT_EQ(saved_offset, testdb->db_offset);
+    T_ASSERT_EQ(dberr, 0);
+    blkh_t *newblk = db_alloc_blk(testdb, next_blkno, tbl, true, &dberr);
+    T_ASSERT(newblk);
+    uint16_t next_blkno2 = db_next_blkno(testdb, &dberr);
+    DEBUG(DBG_TEST, "next blkno2: %u\n", next_blkno2);
+    T_ASSERT_EQ(next_blkno2, next_blkno+1);
+    T_ASSERT_EQ(dberr, 0);
+cleanup:
+    ASSERT(db_close(testdb, testerr) == 0);
+    return 0;
+}
+
+int test_metainfo_can_be_larger_than_1_page(void) {
+    // insert lots of tables so the serialized metainfo is larger than 1 block (page)
+    ASSERT(db_open(testdb, testerr) == 0);
+    char tblname_prefix[STOR_TBLNAME_MAX-4];
+    memset(tblname_prefix, 'a', sizeof(tblname_prefix));
+    char tblname[STOR_TBLNAME_MAX];
+    memset(tblname, 0, sizeof(tblname));
+    strncpy(tblname, tblname_prefix, sizeof(tblname_prefix));
+    const char *colinfo_str = "id:int,string:varchar";
+    int num_tables = 200;
+    char num_buf[4] = {0};
+    ASSERT(200*STOR_TBLNAME_MAX > STOR_PAGESZ);
+    dberr_t dberr;
+    vec_str_t vtblnames;
+    vec_init(&vtblnames);
+    int res;
+    for (int i = 0; i < num_tables; i++) {
+        memset(tblname+sizeof(tblname_prefix), 0, 4);
+        memset(num_buf, 0, 3);
+        snprintf(num_buf, 4, "%03d", i);
+        strncat(tblname, num_buf, 3);
+        vec_push(&vtblnames, kstrdup(tblname));
+        res = db_add_table(testdb, tblname, colinfo_str, false, &dberr);
+        db_log_lasterr(testdb);
+        T_ASSERT_EQ(0, res);
+    }
+    res = db_flush_meta(testdb, &dberr);
+    T_ASSERT_EQ(0, res);
+    T_ASSERT_EQ(0, db_close(testdb, testerr));
+    // load meta info
+    T_ASSERT_EQ(0, db_open(testdb, testerr));
+
+    int i = 0;
+    char *cur_tblname = NULL;
+cleanup:
+    vec_foreach(&vtblnames, cur_tblname, i) {
+        tbl_t *tbl = db_table_from_name(testdb, cur_tblname);
+        ASSERT(tbl);
+        bool clear_blks = true;
+        bool flushtodisk = false; // we do a bulk flush after dropping all the tables, below
+        int drop_res = db_drop_table(testdb, tbl, clear_blks, flushtodisk, &dberr);
+        T_ASSERT_EQ(0, drop_res);
+        free(tbl);
+    }
+    T_ASSERT_EQ(0, db_flush_meta(testdb, &dberr));
+    vec_deinit(&vtblnames);
+    ASSERT(db_close(testdb, testerr) == 0);
     return 0;
 }
 
@@ -651,15 +786,16 @@ static void init_test_db(db_t *db) {
     db->db_fname = TEST_DB;
     db->db_meta.mt_magic = STOR_META_MAGIC;
     db->db_mt_dirty = true;
-    int res = db_create(db);
+    int res = db_create(db, testerr);
     if (res != 0) {
         die("Couldn't create db: %s\n", strerror(errno));
     }
-    res = db_flush_meta(db);
+    dberr_t dberr = 0;
+    res = db_flush_meta(db, &dberr);
     if (res != 0) {
-        die("Couldn't flush db metainfo: %s\n", strerror(errno));
+        die("Couldn't flush db metainfo: %s\n", dbstrerr(dberr));
     }
-    T_ASSERT_EQ(0, db_close(db));
+    T_ASSERT_EQ(0, db_close(db, testerr));
     //db->db_mem_only = true;
 }
 
@@ -668,6 +804,10 @@ int main(int _argc, char **_argv) {
     argv = _argv;
 
     stor_dbgflags = DBG_ALL;
+    qcoltype_t qtype_varchar;
+    qtype_varchar.type = COLTYPE_VARCHAR;
+    qtype_varchar.size = STOR_VARCHAR_MAX;
+    QCOLTYPE_VARCHAR_DEFAULT = &qtype_varchar;
 
     struct stordb db;
     struct stordb_meta dbmeta;
@@ -689,6 +829,9 @@ int main(int _argc, char **_argv) {
     RUN_TEST(test_update_single_value_diff_size_move_same_block);
     RUN_TEST(test_update_single_value_diff_size_grow_down);
     RUN_TEST(test_update_single_value_diff_size_move_diff_block);
+    RUN_TEST(test_varchar_value_bigger_than_255_chars);
+    RUN_TEST(test_db_next_blkno);
+    RUN_TEST(test_metainfo_can_be_larger_than_1_page);
     RUN_TEST(test_delete);
     SKIP_TEST(test_add_lots_of_small_recs);
     rm_test_db();

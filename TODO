@@ -1,2 +1,10 @@
-1) Allow removing tables
-2) Allow dropping columns (harder)
+1) Allow removing tables [] (easy-medium)
+2) Allow dropping and adding columns (medium-hard) []
+3) Add SQL lexer and parser, build query tree => query rewriting => query
+optimizer (split up into smaller goals) []
+4) implement b-tree indexes (split up into smaller goals) []
+5) Allow page sequences, contained pages, etc for large values and even
+pages that are segmented in non-sequential order in case the values grow.
+(medium) []
+6) Allow metainfo to be larger than 1 page (keeps track of page size, has
+normal block header)

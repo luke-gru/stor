@@ -23,15 +23,18 @@
 #include "vec.h"
 
 #define ASSERT(expr) ((expr) ? (void)0 : die("assertion failure (%s:%d) in %s\n", __FILE__, __LINE__, __func__))
+#define ASSERT_MEM(expr) ASSERT(expr)
 
 #define PACKED __attribute__ ((packed))
-#define STOR_BLKSIZ 4096
+#define STOR_PAGESZ 4096
 #define STOR_META_MAGIC 0xbeef
 #define STOR_BLKH_MAGIC 0xfeed
+#define STOR_BLKH_TOMBSTONE 0xbabe
 #define STOR_TBLNAME_MAX 30
 #define STOR_COLNAME_MAX 30
-#define STOR_COLTYPE_MAX 10
+#define STOR_COLTYPE_MAX 20
 #define STOR_VARCHAR_MAX 255
+#define STOR_MAX_TBL_COLS 1024
 
 typedef enum stor_cmd {
     CMD_CREATE = 1,
@@ -51,10 +54,19 @@ typedef enum stor_coltype {
     COLTYPE_DOUBLE,
 } coltype_t;
 
+// qualified column type
+typedef struct {
+    coltype_t type;
+    size_t size;
+} qcoltype_t;
+
 typedef unsigned short tblid_t;
 typedef unsigned short colid_t;
 typedef enum dberr_t {
     DBERR_UNKNOWN = 0,
+    DBERR_DBNAME_INVALID,
+    DBERR_DB_NOT_OPEN,
+    DBERR_LOADING_METAINFO,
     DBERR_TBLNAME_TOO_LONG,
     DBERR_TBLNAME_EXISTS,
     DBERR_TBLNAME_NOEXIST,
@@ -64,6 +76,10 @@ typedef enum dberr_t {
     DBERR_TOO_MANY_REC_VALUES,
     DBERR_VAL_OUT_OF_RANGE,
     DBERR_MISSING_FIND_VALUE,
+    DBERR_SEEK_ERR,
+    DBERR_PARSE_ERR,
+    DBERR_INVALID_BLOCK_OVERWRITE,
+    DBERR_ERRNO,
 } dberr_t;
 
 
@@ -77,7 +93,7 @@ typedef union dbval {
 // tagged value type
 typedef struct dbtval {
     dbval_t val;
-    coltype_t type;
+    qcoltype_t qtype;
 } dbtval_t;
 typedef vec_t(dbtval_t) vec_dbtval_t;
 
@@ -87,7 +103,7 @@ typedef struct dbsrchcrit {
     colid_t col_id;
     int col_idx;
     dbval_t val;
-    coltype_t type;
+    qcoltype_t qtype;
 } dbsrchcrit_t;
 typedef vec_t(dbsrchcrit_t) vec_dbsrchcrit_t;
 
@@ -95,18 +111,12 @@ typedef struct dbsrchopt {
     unsigned long limit;
 } srchopt_t;
 
-typedef struct dbupdval {
-    tblid_t tbl_id;
-    colid_t col_id;
-    int col_idx;
-    dbval_t newval;
-    ssize_t size_diff;
-    coltype_t type;
-} dbupdval_t;
-typedef vec_t(dbupdval_t) vec_dbupdval_t;
-
 static inline const char const *dbstrerr(dberr_t err) {
     switch (err) {
+    case DBERR_DBNAME_INVALID:
+        return "Invalid database name given";
+    case DBERR_LOADING_METAINFO:
+        return "Error loading meta info for database. Possibly corrupted?";
     case DBERR_TBLNAME_TOO_LONG:
         return "Table name too long";
     case DBERR_TBLNAME_EXISTS:
@@ -125,6 +135,14 @@ static inline const char const *dbstrerr(dberr_t err) {
         return "Value out of range";
     case DBERR_MISSING_FIND_VALUE:
         return "Missing value for find";
+    case DBERR_SEEK_ERR:
+        return "File seek error";
+    case DBERR_PARSE_ERR:
+        return "Parse error";
+    case DBERR_INVALID_BLOCK_OVERWRITE:
+        return "Can't overwrite file block";
+    case DBERR_ERRNO:
+        return "Error with system call or library function. Check errno for details.";
     default:
         return "Unknown";
     }
@@ -134,39 +152,32 @@ static inline const char const *dbstrerr(dberr_t err) {
 #define DB_COL_SER_BYTES(colp) (sizeof(*colp))
 typedef struct stordb_col {
     colid_t col_id;
-    coltype_t col_type;
+    qcoltype_t qcol_type;
     char col_name[STOR_COLNAME_MAX];
 } PACKED col_t;
 
-typedef vec_t(struct stordb_col) vec_col_t;
-typedef vec_t(uint16_t) vec_blknum_t;
+typedef vec_t(col_t) vec_col_t;
+typedef vec_t(uint16_t) vec_blkno_t;
 
 #define DB_TBL_SER_BYTES_PRELOAD(tblp) (sizeof(*tblp))
 #define DB_TBL_SER_BYTES_POSTLOAD(tblp) (\
-        DB_TBL_SER_BYTES_PRELOAD(tblp)+(tblp->tbl_num_cols*sizeof(struct stordb_col))\
-        +(tblp->tbl_num_blks*sizeof(uint16_t)))
+        DB_TBL_SER_BYTES_PRELOAD(tblp)+((tblp)->tbl_num_cols*sizeof(col_t))\
+        +((tblp)->tbl_num_blks*sizeof(uint16_t)))
 typedef struct stordb_tbl {
     tblid_t tbl_id;
     char tbl_name[STOR_TBLNAME_MAX];
     uint16_t tbl_num_cols;
     uint16_t tbl_num_blks;
     vec_col_t tbl_cols;
-    vec_blknum_t tbl_blks;
+    vec_blkno_t tbl_blknos;
 } PACKED tbl_t;
 
-typedef vec_t(struct stordb_tbl*) vec_tblp_t;
-
-#define DB_META_SER_BYTES(metap) (sizeof(*metap) - sizeof((metap)->mt_tbls))
-typedef struct stordb_meta {
-    uint16_t mt_magic;
-    uint16_t mt_num_tables;
-    size_t mt_sersize; // meta info serialized size, including all serialized tables
-    vec_tblp_t mt_tbls;
-} PACKED meta_t;
+typedef vec_t(tbl_t*) vec_tblp_t;
 
 typedef struct db_tagged_err {
     dberr_t err;
     char *msg;
+    int err_errno;
 } dbterr_t;
 
 // block header
@@ -175,17 +186,27 @@ typedef struct db_tagged_err {
 typedef struct stordb_blk_h {
     uint16_t bh_magic;
     uint16_t bh_blkno;
+    uint16_t bh_nextblkno; // for segmented blocks
     tblid_t bh_tbl_id;
     uint16_t bh_free;
-    uint16_t bh_num_records;
+    uint16_t bh_num_records; // num records in this page (doesn't count records in subsequent pages)
     // NOTE: offsets are from the start of the block header, NOT from the start of this array
     uint16_t bh_record_offsets[];
 } PACKED blkh_t;
-
 typedef vec_t(blkh_t*) vec_blkp_t;
 
-#define REC_VALUES_PTR(recp) (((char*)(recp))+(recp->header.rech_sz))
-#define REC_VALUE_PTR(recp,n) (((char*)(recp))+(recp->header.rech_sz+recp->header.rec_offsets[(n)]))
+#define DB_META_SER_BYTES(metap) (sizeof(*metap) - (sizeof((metap)->mt_tbls)+sizeof((metap)->mt_blks)))
+typedef struct stordb_meta { // beginning of meta info (always starts at blk #0)
+    uint16_t mt_magic;
+    uint16_t mt_num_tables;
+    size_t mt_sersize; // meta info serialized size, including all serialized tables
+    uint16_t mt_nextblkno; // when mt_sersize > STOR_PAGESZ, this is non-zero.
+    vec_tblp_t mt_tbls;
+    vec_blkp_t mt_blks; // when mt_sersize > STOR_PAGESZ, we keep track of all extra blocks for meta info
+} PACKED meta_t;
+
+#define REC_VALUES_PTR(recp) (PTR(recp)+(recp->header.rech_sz))
+#define REC_VALUE_PTR(recp,n) (PTR(recp)+(recp->header.rech_sz+recp->header.rec_offsets[(n)]))
 #define REC_SZ(recp) (recp->header.rech_sz+recp->header.rec_sz)
 #define REC_H_TOMBSTONE_VALUE (SIZE_MAX)
 #define REC_IS_TOMBSTONED(recp) (*(size_t*)recp == REC_H_TOMBSTONE_VALUE)
@@ -232,29 +253,30 @@ typedef struct stordb {
     vec_blkp_t db_blkcache; // data blocks loaded into memory
     vec_int_t db_blksdirty; // data blocks needing to be written back to disk
     vec_blkinfo_t db_vblkinfo; // cached info on data blocks, such as computed holes, etc.
-    struct stordb_meta db_meta;
+    meta_t db_meta;
 } db_t;
 
 #define BLK_RECORDS_FOREACH(blkh, var, idx)\
 for ((idx) = 0;\
     ((idx) < (blkh)->bh_num_records) &&\
-    (var = (rec_t*)(((char*)(blkh))+blkh->bh_record_offsets[idx]));\
+    (var = (rec_t*)(PTR(blkh)+blkh->bh_record_offsets[idx]));\
     idx++)
 
 #define PTR(ptr) ((char*)(ptr))
 
 #define BLK_FITS_RECSZ(blkh,recsz) ((blkh)->bh_free >= (recsz+sizeof(uint16_t)))
-#define BLK_CONTAINS_REC(blkh,recp) ((PTR(recp))-PTR((blkh)) > 0 && (PTR(recp))-(PTR(blkh)) < STOR_BLKSIZ)
+#define BLK_CONTAINS_REC(blkh,recp) ((PTR(recp))-PTR((blkh)) > 0 && (PTR(recp))-(PTR(blkh)) < STOR_PAGESZ)
 #define BLKH_SIZE(blkh) (sizeof(*blkh)+(blkh->bh_num_records*sizeof(uint16_t)))
-#define BLK_END(blkp) (PTR(blkp)+STOR_BLKSIZ)
-#define BLK_FREE_INITIAL (STOR_BLKSIZ-sizeof(blkh_t))
+#define BLK_END(blkp) (PTR(blkp)+STOR_PAGESZ)
+#define BLK_FREE_INITIAL (STOR_PAGESZ-sizeof(blkh_t))
 
-void die(const char *fmt, ...);
-int db_create(db_t *db);
-int db_open(db_t *db);
-int db_close(db_t *db);
-int db_add_table(db_t *db, const char *tblname, const char *colinfo, dberr_t *dberr);
+int db_create(db_t *db, dberr_t *dberr);
+int db_open(db_t *db, dberr_t *dberr);
+int db_close(db_t *db, dberr_t *dberr);
+int db_clear(db_t *db, dberr_t *dberr);
+int db_add_table(db_t *db, const char *tblname, const char *colinfo, bool flush_to_disk, dberr_t *dberr);
 blkh_t *db_find_blk_for_rec(db_t *db, tbl_t *tbl, size_t recsz, bool alloc_if_not_found, uint16_t *blk_offset, bool *isnewblk);
+int db_drop_table(db_t *db, tbl_t *tbl, bool clear_blks, bool flush_to_disk, dberr_t *dberr);
 int db_add_record(db_t *db, const char *tblname, const char *rowvals, blkh_t **blkh_out, bool flushblk, dberr_t *dberr);
 int db_parse_srchcrit(db_t *db, tbl_t *tbl, const char *srchcrit_str, vec_dbsrchcrit_t *vsearch_crit, dberr_t *dberr);
 int db_find_records(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, srchopt_t *options, vec_recinfo_t *vrecinfo_out, dberr_t *dberr);
@@ -262,14 +284,16 @@ int db_update_records(db_t *db, vec_recinfo_t *vrecinfo, vec_dbsrchcrit_t *vupda
 int db_delete_records(db_t *db, vec_recinfo_t *vrecinfo, dberr_t *dberr);
 int db_find_record(db_t *db, tbl_t *tbl, vec_dbsrchcrit_t *vsearch_crit, recinfo_t *recinfo_out, dberr_t *dberr);
 int db_move_record_to_blk(db_t *db, rec_t *rec, blkh_t *oldblk, blkh_t *newblk, uint16_t newrec_blkoff, rec_t **rec_out, dberr_t *dberr);
-blkh_t *db_load_blk(db_t *db, uint16_t num);
-blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl);
+blkh_t *db_load_blk(db_t *db, uint16_t num, bool restore_dboffset);
+blkh_t *db_alloc_blk(db_t *db, uint16_t num, tbl_t *tbl, bool allow_overwrite, dberr_t *dberr);
+int db_clear_blk(db_t *db, uint16_t num, dberr_t *dberr);
+uint16_t db_next_blkno(db_t *db, dberr_t *dberr);
 tbl_t *db_table_from_idx(db_t *db, int idx);
 tbl_t *db_table_from_id(db_t *db, tblid_t tblid);
 tbl_t *db_table_from_name(db_t *db, const char *tblname);
 col_t *db_col_from_idx(tbl_t *tbl, int idx);
 col_t *db_col_from_name(tbl_t *tbl, const char *name, int *colidx);
-int db_flush_meta(db_t *db);
+int db_flush_meta(db_t *db, dberr_t *dberr);
 int db_flush_dirty_blks(db_t *db);
 
 rec_t *BLK_LAST_REC(blkh_t *blk);
@@ -285,9 +309,11 @@ blkinfo_t *db_blkinfo(db_t *db, blkh_t *blk);
 
 dbval_t REC_DBVAL(rec_t *rec, int colidx, coltype_t type);
 void *DBVAL_PTR(dbval_t *dbval, coltype_t type);
-size_t DBVAL_SZ(dbval_t *val, coltype_t type);
-const char *coltype_str(coltype_t coltype);
+size_t DBVAL_SZ(dbval_t *val, qcoltype_t *qtype);
+const char *coltype_str(qcoltype_t *qcoltype);
+int db_coltype(db_t *db, char *coltype_str, qcoltype_t *qtype_out, dberr_t *dberr);
 
-void db_log_last_err(db_t *db);
+void db_log_lasterr(db_t *db);
+void die(const char *fmt, ...);
 
 #endif

@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-I./include -std=c99 -Wall -Werror -g
+CFLAGS=-I./include -std=c99 -Wall -Werror -Wno-unused-label -g
 ODIR=build
 
 .PHONY: stor
